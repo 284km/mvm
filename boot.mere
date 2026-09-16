@@ -179,6 +179,14 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
       let _ = vs_listen vs path port in
       listen_all rest in
   let _ = listen_all (env_or "MVM_VSOCK_IN") in
+  // And a socket to ask for more. Ports published after the machine started
+  // cannot be named here, because nothing knows them yet.
+  let ctlpath = env_or "MVM_CONTROL" in
+  let _ = if str_len ctlpath > 0 then
+            (if hv_ctl_listen ctlpath == 0 then
+               (let _ = print_err ("mvm: control socket at " ++ ctlpath) in ())
+             else (let _ = print_err ("mvm: cannot open a control socket at " ++ ctlpath) in ()))
+          else () in
   let _ = if str_len vspath > 0 then print_err ("mvm: vsock host end " ++ vspath) else () in
   let disk_sectors = if str_len disk == 0 then 0 else file_size disk / 512 in
   let _ = if str_len disk > 0 then

@@ -1,0 +1,139 @@
+// mports.mere — open the host's end of a published port, when it is published.
+//
+//   mports <docker socket> <control socket> [poll ms]
+//
+// WHY THIS EXISTS. A container that publishes a port needs a listener on the
+// HOST, and only the host can open one. Nothing knows the number until the
+// container asks: it cannot be named when the machine starts, which is what
+// every port here needed until now. So this watches the Docker API for
+// published ports and asks the VMM to open and close the host's end of each.
+//
+// WHAT IT IS NOT. It does not carry any bytes. The VMM's listener does that,
+// and the forwarder in the guest does the last hop; this only decides WHICH
+// ports exist, which is the one thing neither of them can know.
+
+extern fn mp_connect: str -> int;
+extern fn mp_send: int -> str -> int;
+extern fn mp_recv: int -> int -> str;
+extern fn mp_close: int -> int;
+
+// ---- the Docker API -------------------------------------------------------
+
+let api_get = fn (sock: str) -> fn (path: str) ->
+  let fd = mp_connect sock in
+  if fd < 0 then ""
+  else
+    let req = "GET " ++ path ++ " HTTP/1.1\r\nHost: localhost\r\n"
+           ++ "Accept: application/json\r\nConnection: close\r\n\r\n" in
+    let _ = mp_send fd req in
+    let body = mp_recv fd 3000 in
+    let _ = mp_close fd in
+    body;
+
+// The published host ports in a /containers/json response.
+//
+// This looks for one field rather than parsing the document. That is a
+// deliberate limit and it is worth naming: the answer comes from a daemon in
+// this same project, the field is a bare number, and a JSON parser here would
+// be a second one to keep correct. If the shape ever changes, this finds
+// nothing rather than something wrong -- and the gate notices, because the
+// port stops answering.
+let public_ports = fn (body: str) ->
+  let key = "\"PublicPort\":" in
+  let n = str_len body in
+  let out = vec_new () in
+  let rec scan = fn (from: int) ->
+    if from >= n then ()
+    else
+      let rest = substring body from n in
+      let i = str_index_of rest key in
+      if i < 0 then ()
+      else
+        let p = from + i + str_len key in
+        let rec digits = fn (j: int) -> fn (acc: int) ->
+          if j >= n then (acc, j)
+          else
+            let c = ord (char_at body j) in
+            if c >= 48 && c <= 57 then digits (j + 1) (acc * 10 + (c - 48)) else (acc, j) in
+        let (port, j) = digits p 0 in
+        let _ = if port > 0 then (let _ = vec_push out port in ()) else () in
+        scan j in
+  let _ = scan 0 in
+  out;
+
+// ---- the VMM's control socket ---------------------------------------------
+
+let control = fn (sock: str) -> fn (cmd: str) ->
+  let fd = mp_connect sock in
+  if fd < 0 then "err cannot reach the control socket"
+  else
+    let _ = mp_send fd (cmd ++ "\n") in
+    let reply = mp_recv fd 3000 in
+    let _ = mp_close fd in
+    // The reply has a newline on it; the caller wants the sentence.
+    let e = str_index_of reply "\n" in
+    if e < 0 then reply else substring reply 0 e;
+
+// ---- the set of ports this has asked for ----------------------------------
+//
+// A vector with 0 for an empty slot, because a port is never 0 and there is no
+// way to shorten a vector here. Removal marks; the next port reuses the mark.
+
+let has = fn (v) -> fn (x: int) ->
+  let rec go = fn (i: int) ->
+    if i == vec_len v then false
+    else if (vec_get v i : int) == x then true else go (i + 1) in
+  go 0;
+
+let put = fn (v) -> fn (x: int) ->
+  let rec go = fn (i: int) ->
+    if i == vec_len v then (let _ = vec_push v x in ())
+    else if (vec_get v i : int) == 0 then (let _ = vec_set v i x in ())
+    else go (i + 1) in
+  go 0;
+
+let drop_at = fn (v) -> fn (k: int) -> vec_set v k 0;
+
+// ---- the loop -------------------------------------------------------------
+
+let run = fn (dsock: str) -> fn (csock: str) -> fn (every: int) ->
+  let _ = print_err ("mports: watching " ++ dsock ++ ", asking " ++ csock) in
+  let open_ports = vec_new () in
+  let rec loop = fn (u: unit) ->
+    let body = api_get dsock "/v1.43/containers/json" in
+    let want = public_ports body in
+    // Open what is new.
+    let rec add = fn (i: int) ->
+      if i == vec_len want then ()
+      else
+        let p = (vec_get want i : int) in
+        let _ = if has open_ports p then ()
+                else
+                  let r = control csock ("LISTEN " ++ show p) in
+                  let _ = print_err ("mports: LISTEN " ++ show p ++ " -> " ++ r) in
+                  let _ = if str_len r > 1 && substring r 0 2 == "ok" then
+                            (let _ = put open_ports p in ()) else () in
+                  () in
+        add (i + 1) in
+    let _ = add 0 in
+    // Close what has gone. Walking backwards because the list shrinks.
+    let rec rm = fn (i: int) ->
+      if i < 0 then ()
+      else
+        let p = (vec_get open_ports i : int) in
+        let _ = if p == 0 || has want p then ()
+                else
+                  let r = control csock ("UNLISTEN " ++ show p) in
+                  let _ = print_err ("mports: UNLISTEN " ++ show p ++ " -> " ++ r) in
+                  let _ = drop_at open_ports i in
+                  () in
+        rm (i - 1) in
+    let _ = rm (vec_len open_ports - 1) in
+    let _ = sleep_ms every in
+    loop () in
+  loop ();
+
+match args () with
+| [dsock, csock] -> run dsock csock 500
+| [dsock, csock, every] -> run dsock csock (int_of_str every)
+| _ -> let _ = print_err "usage: mports <docker socket> <control socket> [poll ms]" in exit 2

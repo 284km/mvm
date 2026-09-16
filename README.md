@@ -26,9 +26,15 @@ $ docker -H unix://.build/docker.sock compose up
 Attaching to hello-1
 hello-1  | hello-from-compose
 
-$ nc 127.0.0.1 18080
-hello-from-the-container
+$ docker -H unix://.build/docker.sock run -d -p 19090:8080 alpine \
+    sh -c 'while true; do echo hello-from-19090 | nc -l -p 8080; done'
+$ nc 127.0.0.1 19090
+hello-from-19090
 ```
+
+Nothing was told about 19090 beforehand. The container asks for it, `mports`
+notices, and the VMM opens the host's end — and closes it again when the
+container goes.
 
 Everything after the client is Mere: this VMM, the vsock device it carries the
 stream over, [mengd](https://github.com/284km/mengd) answering the Docker
@@ -295,12 +301,36 @@ same daemon over a plain unix socket. Every check that existed was green.
 `test/stack.sh` now abandons a streaming connection on purpose and requires the
 VMM to survive it and say so.
 
+## Three programs and one number
+
+A published port needs all three, and each knows something the others cannot:
+
+| | what it does | what only it knows |
+|---|---|---|
+| `mports` (host) | watches the Docker API, asks for ports | which ports are published |
+| `mvm` (host) | opens the host's TCP port, carries the stream | that there is a VM at all |
+| `mfwd` (guest) | enters the container's namespace, connects | where the container is listening |
+
+They agree on one number and nothing else: **the vsock port is the published
+host port**. That convention needs no negotiation, because whoever opened the
+host's end already chose it.
+
+`MVM_CONTROL=<path>` is where the asking happens — one line in, one line out:
+
+```
+LISTEN 19090      -> ok listening 19090
+UNLISTEN 19090    -> ok closed 19090
+PORTS             -> ok 2 listeners
+```
+
+It is the VMM's socket, not the guest's, and it says nothing about containers:
+it opens and closes host ports, and who wanted one is the caller's business.
+
 ## What is next
 
-**Ports that are not agreed in advance.** The host's end of a published port
-has to be open before the VM starts, because opening it is the host's job and
-nothing in the guest can ask for one yet. Making that dynamic means a control
-channel between the daemon and the VMM, which is what a host agent is for.
+**More than one machine's worth.** One guest, one docker socket, one set of
+ports. Two VMs would need the control socket to say which — and that is the
+first thing here that would benefit from a name rather than a number.
 
 The language change this project expected never arrived. `Raw`, Mere's window
 type for physical memory, was going to need a second source so that a virtio

@@ -41,6 +41,13 @@ extern fn hv_vs_recv: int -> str -> int -> int;
 extern fn hv_vs_ready: int -> int;
 extern fn hv_vs_mute: int -> int;
 extern fn hv_vs_wake: unit -> int;
+extern fn hv_vs_unlisten: int -> int;
+extern fn hv_vs_listener_count: unit -> int;
+extern fn hv_ctl_listen: str -> int;
+extern fn hv_ctl_accept: unit -> int;
+extern fn hv_ctl_line: int -> str;
+extern fn hv_ctl_reply: int -> str -> int;
+extern fn hv_ctl_close: int -> int;
 
 let vs_base = 0xa000200;
 let vs_intid = 49;                  // SPI 17 in the device tree, which is 32+17
@@ -315,11 +322,84 @@ let vs_accept = fn (s) ->
           let _ = print_err "mvm: vsock dropped that inward stream; the guest was not ready" in 0
         else 1;
 
+// ---- the control socket ---------------------------------------------------
+//
+// A published port's host end has to be opened by the host, and nothing knows
+// which port until a container asks for one. So there is a socket to ask on.
+// Three verbs, one line each, and every answer names what happened:
+//
+//   LISTEN <port>    -> ok listening <port>   / err <reason>
+//   UNLISTEN <port>  -> ok closed <port>      / err no listener for <port>
+//   PORTS            -> ok <n> listeners
+//
+// It is the VMM's own socket, not the guest's, and it says nothing about
+// containers: it opens and closes host ports, and who wanted one is the
+// caller's business.
+
+let vs_word = fn (line: str) -> fn (n: int) ->
+  let rec go = fn (i: int) -> fn (start: int) -> fn (seen: int) ->
+    if i >= str_len line then (if seen == n then substring line start (str_len line) else "")
+    else if char_at line i == " " then
+      (if seen == n then substring line start i else go (i + 1) (i + 1) (seen + 1))
+    else go (i + 1) start seen in
+  go 0 0 0;
+
+// A number from a word, or 0 for anything else. int_of_str aborts on input
+// that is not a number, and this word came off a socket -- a caller that types
+// nonsense must get an answer, not take the machine down.
+let vs_num = fn (t: str) ->
+  let n = str_len t in
+  if n == 0 then 0
+  else
+    let rec go = fn (i: int) -> fn (acc: int) ->
+      if i == n then acc
+      else
+        let c = ord (char_at t i) in
+        if c < 48 || c > 57 then 0 - 1
+        else go (i + 1) (acc * 10 + (c - 48)) in
+    let v = go 0 0 in
+    if v < 0 then 0 else v;
+
+let vs_ctl_do = fn (s) -> fn (line: str) ->
+  let verb = vs_word line 0 in
+  let arg = vs_word line 1 in
+  let port = vs_num arg in
+  if verb == "PORTS" then "ok " ++ show (hv_vs_listener_count ()) ++ " listeners"
+  else if verb == "LISTEN" then
+    (if port <= 0 || port > 65535 then "err " ++ arg ++ " is not a port"
+     else
+       let r = hv_vs_listen ("tcp:" ++ show port) port in
+       if r == 0 then
+         let _ = print_err ("mvm: listening on host port " ++ show port
+                         ++ " for guest vsock " ++ show port) in
+         "ok listening " ++ show port
+       else if r == 0 - 2 then "err no room for another listener"
+       else "err cannot listen on " ++ show port)
+  else if verb == "UNLISTEN" then
+    (if hv_vs_unlisten port == 0 then
+       let _ = print_err ("mvm: closed host port " ++ show port) in
+       "ok closed " ++ show port
+     else "err no listener for " ++ show port)
+  else if str_len verb == 0 then "err empty"
+  else "err unknown verb " ++ verb;
+
+// One caller, one command, one answer. Called wherever the host end is
+// polled, so it costs nothing while nobody is asking.
+let vs_control = fn (s) ->
+  let c = hv_ctl_accept () in
+  if c < 0 then 0
+  else
+    let line = hv_ctl_line c in
+    let _ = if str_len line == 0 then 0 else hv_ctl_reply c (vs_ctl_do s line) in
+    let _ = hv_ctl_close c in
+    1;
+
 // Drain, not one buffer per wake, and every stream rather than one. A reply
 // larger than one receive buffer is the normal case, and handing over one
 // buffer per wake-up makes the stream's speed a property of how often a thread
 // happens to poll.
 let vs_pump = fn (s) ->
+  let _ = vs_control s in
   let _ = vs_accept s in
   let rec sweep = fn (i: int) -> fn (moved: int) ->
     if i == vs_smax then moved

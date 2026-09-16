@@ -483,6 +483,92 @@ int hv_vs_accept(void) {
  * decides who in the guest answers. */
 int hv_vs_accepted_port(void) { return VS_LAST_PORT; }
 
+/* ---- the control socket -------------------------------------------------
+ *
+ * A published port's host end has to be OPENED, and only the host can open it,
+ * and nothing knows which port until a container asks for it. So there is a
+ * socket to ask on: one line in, one line out.
+ *
+ *   LISTEN <port>    open host TCP <port>, delivering to guest vsock <port>
+ *   UNLISTEN <port>  close it
+ *   PORTS            what is open
+ *
+ * The protocol is parsed in Mere; this is the socket underneath it. The port
+ * numbers are the same on both sides for the reason the rest of this file
+ * gives: whoever opened the host end already chose the number, so there is
+ * nothing for the two ends to agree about.
+ */
+static int CTL_FD = -1;
+
+int hv_ctl_listen(const char *path) {
+    if (CTL_FD >= 0) return -2;
+    unlink(path);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    if (listen(fd, 8) != 0) { close(fd); return -1; }
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    CTL_FD = fd;
+    return 0;
+}
+
+int hv_ctl_accept(void) {
+    if (CTL_FD < 0) return -1;
+    int c = accept(CTL_FD, NULL, NULL);
+    return c < 0 ? -1 : c;
+}
+
+/* One line, without its newline. "" for end of file or nothing within the
+ * timeout -- a caller that connected and said nothing must not stop the vCPU.
+ */
+static _Thread_local char CTL_LINE[512];
+const char *hv_ctl_line(int fd) {
+    size_t n = 0;
+    while (n + 1 < sizeof CTL_LINE) {
+        struct pollfd pf; pf.fd = fd; pf.events = POLLIN; pf.revents = 0;
+        if (poll(&pf, 1, 200) <= 0) break;
+        char c;
+        ssize_t r = read(fd, &c, 1);
+        if (r <= 0) break;
+        if (c == '\n') break;
+        if (c != '\r') CTL_LINE[n++] = c;
+    }
+    CTL_LINE[n] = 0;
+    return CTL_LINE;
+}
+
+int hv_ctl_reply(int fd, const char *s) {
+    size_t len = strlen(s);
+    if (write(fd, s, len) < 0) return -1;
+    if (write(fd, "\n", 1) < 0) return -1;
+    return 0;
+}
+
+int hv_ctl_close(int fd) { return close(fd); }
+
+/* Close the listener that delivers to this guest port. Returns 0, or -1 when
+ * there was no such listener -- which the caller reports rather than swallows,
+ * because "closed it" and "there was nothing to close" are different answers.
+ */
+int hv_vs_unlisten(int gport) {
+    vs_init();
+    for (int k = 0; k < VS_LN; k++) {
+        if (VS_LPORT[k] != gport) continue;
+        close(VS_LFD[k]);
+        for (int j = k; j + 1 < VS_LN; j++) { VS_LFD[j] = VS_LFD[j + 1]; VS_LPORT[j] = VS_LPORT[j + 1]; }
+        VS_LN--;
+        return 0;
+    }
+    return -1;
+}
+
+int hv_vs_listener_count(void) { vs_init(); return VS_LN; }
+
 /* Stop reading from this end without closing it. An fd at end of file stays
  * readable forever, so a poll that still watched it would spin, and a close
  * would take the write direction with it. */
@@ -555,11 +641,12 @@ static volatile int VS_WATCH_RUN;
 static void *vs_watch_thread(void *arg) {
     (void)arg;
     while (VS_WATCH_RUN) {
-        struct pollfd pf[VS_MAX + VS_LMAX];
+        struct pollfd pf[VS_MAX + VS_LMAX + 1];
         int n = 0;
         for (int k = 0; k < VS_LN; k++) {
             pf[n].fd = VS_LFD[k]; pf[n].events = POLLIN; pf[n].revents = 0; n++;
         }
+        if (CTL_FD >= 0) { pf[n].fd = CTL_FD; pf[n].events = POLLIN; pf[n].revents = 0; n++; }
         for (int i = 0; i < VS_MAX; i++)
             if (VS_FD[i] >= 0 && !VS_MUTE[i]) { pf[n].fd = VS_FD[i]; pf[n].events = POLLIN; pf[n].revents = 0; n++; }
         if (n == 0) {

@@ -56,6 +56,8 @@ cp "$MRUN_SRC/.build/mrun-linux" "$out/extra-mengd/mrun"
 docker run --rm -v "$out:/o" -v "$here/guest:/g:ro" -w /o "$IMG" \
   cc -O2 -static -o /o/mfwd-linux /o/mfwd.c /g/fwd_shim.c >/dev/null 2>&1
 cp "$out/mfwd-linux" "$out/extra-mengd/mfwd"
+"$M" -c "$here/mports.mere" > "$out/mports.c" 2>"$out/e6" || { echo FAIL mports emit; sed -n 1,8p "$out/e6"; exit 1; }
+cc -O2 -o "$out/mports" "$out/mports.c" "$here/mports_shim.c" 2>/dev/null || { echo FAIL cc mports; exit 1; }
 chmod 755 "$out/extra-mengd/mengd" "$out/extra-mengd/mrun" "$out/extra-mengd/mfwd"
 
 echo "== build the VMM and a root filesystem =="
@@ -77,6 +79,7 @@ ROOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 root=/dev/vda rw ini
 # fails, and the OLD guest answers it. A poison then passes because the machine
 # it was meant to break is not the machine being asked.
 stop_vm() {
+  if [ -n "${MPPID:-}" ]; then kill "$MPPID" 2>/dev/null; wait "$MPPID" 2>/dev/null; MPPID=""; fi
   if [ -n "${VMPID:-}" ]; then
     kill "$VMPID" 2>/dev/null
     wait "$VMPID" 2>/dev/null
@@ -94,6 +97,7 @@ stop_vm() {
     while [ "$i" -lt 20 ] && lsof -nP -iTCP:18080 >/dev/null 2>&1; do sleep 0.25; i=$((i + 1)); done
   fi
   lsof -nP -iTCP:18080 >/dev/null 2>&1 && echo "  WARN  host port 18080 is still held" || true
+  rm -f "$out/mvm.ctl"
 }
 
 boot_it() {  # boot_it <mvm binary> <dtb> <disk> <console> <vmm log> <socket>
@@ -103,7 +107,8 @@ boot_it() {  # boot_it <mvm binary> <dtb> <disk> <console> <vmm log> <socket>
   # job and nothing in the guest can ask for it yet -- so the number is agreed
   # in advance, and the convention that needs no other agreement is that the
   # vsock port IS the published host port.
-  MVM_VSOCK_IN="$6=1024,tcp:18080=18080" MVM_TIMEOUT_MS=$((SECS * 1000 + 60000)) \
+  MVM_VSOCK_IN="$6=1024,tcp:18080=18080" MVM_CONTROL="$out/mvm.ctl" \
+  MVM_TIMEOUT_MS=$((SECS * 1000 + 60000)) \
       "$1" "$IMAGE_FILE" "$2" "" "$3" > "$4" 2> "$5" &
   VMPID=$!
   i=0
@@ -194,6 +199,33 @@ done
 # entry away and nothing answers. The daemon's own log line would be better
 # evidence and cannot be used: the guest's console is /dev/kmsg and the kernel
 # rate-limits it, so a busy daemon's lines are exactly the ones dropped.
+
+echo "== a port nobody arranged in advance =="
+# 19090 appears nowhere: not in MVM_VSOCK_IN, not on any command line. The
+# container asks for it, mports notices, and the VMM opens the host's end --
+# which is the one thing neither the VMM nor the guest can decide alone.
+lsof -nP -iTCP:19090 >/dev/null 2>&1 && { echo "  FAIL  19090 was already open before anything asked"; fail=1; } \
+  || echo "  ok    19090 is not open before anything asks for it"
+"$out/mports" "$SOCK" "$out/mvm.ctl" 400 > "$out/mports.log" 2>&1 &
+MPPID=$!
+d run -d --name web9 -p 19090:8080 alpine:latest \
+  sh -c 'while true; do echo hello-from-19090 | nc -l -p 8080; done' >/dev/null 2>&1
+say $? "a container publishes it"
+i=0; while [ "$i" -lt 30 ] && ! lsof -nP -iTCP:19090 >/dev/null 2>&1; do sleep 0.5; i=$((i + 1)); done
+lsof -nP -iTCP:19090 >/dev/null 2>&1; say $? "and the host's end opens on its own"
+ans9=""
+for try in 1 2 3 4 5; do
+  ans9=$(echo | nc -w 3 127.0.0.1 19090 2>/dev/null | head -1)
+  [ -n "$ans9" ] && break
+  sleep 1
+done
+[ "$ans9" = "hello-from-19090" ]; say $? "the container answers through it ($ans9)"
+grep -q "LISTEN 19090 -> ok listening 19090" "$out/mports.log"; say $? "and the VMM said so on its control socket"
+d rm -f web9 >/dev/null 2>&1
+i=0; while [ "$i" -lt 30 ] && lsof -nP -iTCP:19090 >/dev/null 2>&1; do sleep 0.5; i=$((i + 1)); done
+lsof -nP -iTCP:19090 >/dev/null 2>&1 && { echo "  FAIL  the port outlived the container"; fail=1; } \
+  || echo "  ok    and closes again when the container goes"
+kill "$MPPID" 2>/dev/null; wait "$MPPID" 2>/dev/null; MPPID=""
 
 echo "== a client that hangs up must not take the VMM with it =="
 # The default action for SIGPIPE is to kill the process, and a VMM that dies
