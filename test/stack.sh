@@ -12,6 +12,9 @@
 # WHAT IT NEEDS:
 #   MERE=<a merelang/mere checkout>   MENGD_SRC=<284km/mengd>   MRUN_SRC=<284km/mrun>
 #   an arm64 Image in .build/, and VSMOD=<dir> with the three vsock modules
+#   plus overlay.ko -- all from THAT kernel, all =m in a stock one. Without
+#   overlay.ko the daemon in the guest can still build images, but it writes
+#   the whole root filesystem as one layer; the boot line it prints says which.
 #   (see test/vsock.sh for where those come from), and a container runtime.
 set -u
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -165,6 +168,11 @@ say $? "and the guest knows what year it is"
 want_k=$(( ${MVM_RAM_MB:-4096} * 1024 ))
 grep -qa "] Memory: .*/${want_k}K available" "$c"
 say $? "the guest was given the ${want_k}K the VMM mapped"
+# A build step's layer IS the upper directory of an overlay mount. The module
+# missing and the mount being refused look identical hours later, at build
+# time, so the guest says which at boot and this reads that line.
+grep -qa "] userspace: overlay mounts" "$c"
+say $? "the guest can mount an overlay (a build step's layer is its upper dir)"
 
 export DOCKER_HOST=
 d() { docker -H "unix://$SOCK" "$@"; }

@@ -26,6 +26,25 @@ for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
 done
 say "vsock modules loaded"
 
+# overlayfs. A build step's layer IS the upper directory of an overlay mount,
+# so without this the daemon can only write the whole root filesystem as one
+# layer. It is =m in a stock kernel like vsock is.
+#
+# Said out loud at boot rather than discovered at build time: the module being
+# absent and the mount being refused produce the same symptom hours later, and
+# this is the only place that can tell them apart.
+if [ -r /opt/overlay.ko ]; then
+  insmod /opt/overlay.ko 2>/dev/null || say "insmod overlay FAILED"
+  mkdir -p /run/ovl/l /run/ovl/u /run/ovl/w /run/ovl/m
+  if mount -t overlay overlay -o lowerdir=/run/ovl/l,upperdir=/run/ovl/u,workdir=/run/ovl/w /run/ovl/m 2>/dev/null; then
+    umount /run/ovl/m; say "overlay mounts"
+  else
+    say "overlay module loaded but mount FAILED"
+  fi
+else
+  say "no overlay.ko: builds will write one flat layer"
+fi
+
 # A container runtime needs these to exist inside the container's own view.
 mkdir -p /var/lib/mengd /usr/local/bin /tmp /run
 cp /opt/mrun /usr/local/bin/mrun && chmod 755 /usr/local/bin/mrun
