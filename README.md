@@ -37,10 +37,21 @@ an ordinary unix socket:
 mvm: vsock stream open, guest port 598999410 to port 1234
 ```
 
-The host's reply is *derived* from what arrived rather than echoed, because an
-echo cannot tell "the bytes made the round trip" apart from "the guest is
-looking at its own transmit buffer". 128 KiB crosses in 8.9 ms by the guest's
-own clock, every byte checked by value at both ends.
+and **in the other direction**, which is the one a daemon inside the VM needs —
+a host program connects to an ordinary path on the host's filesystem and
+reaches a server in the guest:
+
+```
+host got 39 bytes after 3 attempts: guest saw 19 bytes: HELLO FROM THE HOST
+mvm: vsock listening at /tmp/vs-in.sock for guest port 1024
+mvm: vsock inward stream, host port 49153 to guest port 1024
+mvm: vsock inward stream accepted by the guest on port 49153
+```
+
+Each reply is *derived* from what arrived rather than echoed, because an echo
+cannot tell "the bytes crossed" apart from "the caller is looking at its own
+buffer". 128 KiB crosses in 8.9 ms by the guest's own clock, every byte checked
+by value at both ends.
 
 ```
 [    0.000000] Booting Linux on physical CPU 0x0000000000 [0x610f0000]
@@ -55,7 +66,7 @@ mvm: guest called PSCI SYSTEM_RESET
 
 ```sh
 sh initrd/build.sh   # an initramfs from a container image, with the init below
-sh test/vsock.sh     # the guest and a host program hold a conversation
+sh test/vsock.sh     # the guest and a host program hold a conversation, both ways
 sh test/disk.sh      # virtio-blk, judged from both ends
 sh test/init.sh      # userspace runs
 sh test/boot.sh      # the kernel boots and panics for the right reason
@@ -207,20 +218,19 @@ descriptor chain is not the shape the specification requires is answered
 `VIRTIO_BLK_S_UNSUPP` rather than guessed at. See `DESIGN-virtio.md`.
 
 No network and no SMP, and no console input: PSCI answers `NOT_SUPPORTED` to
-everything except the two calls that end the machine. There *is* a way out of
-the VM — virtio-vsock, whose host end is a unix socket — but only outward: a
-server inside the guest is not reachable from the host yet. See
-`DESIGN-vsock.md`. System registers this VMM does not emulate read as zero
+everything except the two calls that end the machine. There *is* a way in and out of
+the VM — virtio-vsock, whose host end is a unix socket, in both directions —
+but no port mapping: one inward path to one guest port. See `DESIGN-vsock.md`. System registers this VMM does not emulate read as zero
 and drop writes, which is what every VMM does with the debug and trace
 registers a kernel touches on the way up, and is also a place where a guest
 could be quietly misled.
 
 ## What is next
 
-**Connections the other way.** Today the guest connects out and the host
-listens. A container daemon running *inside* the guest needs the opposite: the
-host connects in, to a port the guest is listening on. That is the same device
-and the same queues with the state machine started from the other end.
+**Something worth talking to.** Both directions of vsock work, so the remaining
+step is what runs inside: a root filesystem carrying a container daemon, with
+the host's client reaching it through the inward path. That is integration
+rather than a new device.
 
 The language change this project expected never arrived. `Raw`, Mere's window
 type for physical memory, was going to need a second source so that a virtio

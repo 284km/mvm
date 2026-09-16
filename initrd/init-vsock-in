@@ -1,0 +1,28 @@
+#!/bin/sh
+# initrd/init-vsock-in — the guest half of the INWARD check.
+#
+# Separate from init-vsock on purpose. This one waits for a connection that
+# only arrives if the host end is listening, so putting it in the same script
+# would make every outward run sit until the deadline waiting for a host that
+# was never started.
+mkdir -p /dev || exit 21
+mount -t devtmpfs dev /dev || exit 22
+mkdir -p /proc /sys 2>/dev/null
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+say() { echo "userspace: $1" > /dev/kmsg; }
+say "init-vsock-in starting"
+
+for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
+  if insmod /opt/$m.ko 2>/tmp/e; then say "insmod $m ok"
+  else say "insmod $m FAILED: $(cat /tmp/e)"; fi
+done
+
+# A server INSIDE the guest. The host reaches it through a socket on the host's
+# own filesystem, which is the direction a daemon in here needs.
+/opt/vsock_server 1024 2 > /tmp/srv 2>&1
+rc=$?
+say "vsock_server exit $rc: $(cat /tmp/srv | tr '\n' ' ')"
+say "init-vsock-in done"
+poweroff -f
+exit 99

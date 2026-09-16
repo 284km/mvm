@@ -23,6 +23,10 @@ try: os.unlink(path)
 except FileNotFoundError: pass
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind(path); s.listen(2)
+# A deadline of its own. Without it, a guest that never makes the second
+# connection leaves this blocked in accept() and the gate blocked in wait --
+# and a gate that hangs reports nothing at all, which is worse than red.
+s.settimeout(float(sys.argv[3]) if len(sys.argv) > 3 else 60.0)
 print("listening", flush=True)
 
 def serve_message(c):
@@ -42,7 +46,11 @@ def serve_bulk(c, n):
     c.sendall(bytes(((v + 1) & 0xff) for v in buf))
 
 for which in range(2 if bulk else 1):
-    c, _ = s.accept()
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        print("gave up waiting for connection %d" % (which + 1), flush=True)
+        break
     if which == 0: serve_message(c)
     else: serve_bulk(c, bulk)
     c.close()

@@ -345,6 +345,7 @@ int hv_deadline_fired(void) { return DEADLINE_FIRED; }
 #define VS_MAX 8
 static int VS_FD[VS_MAX];
 static int VS_INIT;
+static int VS_LISTEN_FD = -1;
 
 static void vs_init(void) {
     if (VS_INIT) return;
@@ -366,6 +367,48 @@ int hv_vs_connect(const char *path) {
     a.sun_family = AF_UNIX;
     snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
     if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    VS_FD[h] = fd;
+    return h;
+}
+
+/* The other direction: the HOST connects in, to something listening in the
+ * guest. This is the direction a daemon inside the VM needs, and it is not the
+ * same code with the arguments swapped -- the VMM is the one that has to start
+ * the handshake, on a queue the guest fills for it.
+ *
+ * The listening socket is the VMM's, on the host's filesystem, so an ordinary
+ * host program connects to an ordinary path and does not know a VM is involved.
+ */
+int hv_vs_listen(const char *path) {
+    vs_init();
+    if (VS_LISTEN_FD >= 0) return -2;
+    unlink(path);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    if (listen(fd, 16) != 0) { close(fd); return -1; }
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    VS_LISTEN_FD = fd;
+    return 0;
+}
+
+/* One waiting connection, or -1 for none. Never blocks: this is called from
+ * the vCPU's thread, where blocking means the guest is not running. */
+int hv_vs_accept(void) {
+    vs_init();
+    if (VS_LISTEN_FD < 0) return -1;
+    int h = -1;
+    for (int i = 0; i < VS_MAX; i++) if (VS_FD[i] < 0) { h = i; break; }
+    if (h < 0) return -2;               /* no room: a refusal, not "none waiting" */
+    int fd = accept(VS_LISTEN_FD, NULL, NULL);
+    if (fd < 0) return -1;
     int fl = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
     VS_FD[h] = fd;
@@ -430,31 +473,34 @@ int hv_vs_ready(int h) {
  * It signals rather than copies: everything about the queue still happens on
  * the vCPU's thread, and this only decides WHEN.
  */
-static volatile int VS_WATCH_H = -1;
 static volatile int VS_WATCH_RUN;
 
 static void *vs_watch_thread(void *arg) {
     (void)arg;
     while (VS_WATCH_RUN) {
-        int h = VS_WATCH_H;
-        if (h < 0 || h >= VS_MAX || VS_FD[h] < 0) {
+        struct pollfd pf[VS_MAX + 1];
+        int n = 0;
+        if (VS_LISTEN_FD >= 0) {
+            pf[n].fd = VS_LISTEN_FD; pf[n].events = POLLIN; pf[n].revents = 0; n++;
+        }
+        for (int i = 0; i < VS_MAX; i++)
+            if (VS_FD[i] >= 0) { pf[n].fd = VS_FD[i]; pf[n].events = POLLIN; pf[n].revents = 0; n++; }
+        if (n == 0) {
             struct timespec ts = { 0, 5 * 1000 * 1000L }; nanosleep(&ts, NULL);
             continue;
         }
-        struct pollfd pf; pf.fd = VS_FD[h]; pf.events = POLLIN; pf.revents = 0;
-        if (poll(&pf, 1, 20) > 0) {
+        if (poll(pf, (nfds_t)n, 20) > 0) {
             hv_vcpu_t v = VCPU;
             hv_vcpus_exit(&v, 1);
-            /* The data is still readable until the vCPU's thread takes it, so
-             * without a pause this spins on the same readiness. */
+            /* Whatever it was stays readable until the vCPU's thread takes it,
+             * so without a pause this spins on the same readiness. */
             struct timespec ts = { 0, 2 * 1000 * 1000L }; nanosleep(&ts, NULL);
         }
     }
     return NULL;
 }
 
-int hv_vs_wake_on(int h) {
-    VS_WATCH_H = h;
+int hv_vs_wake(void) {
     if (VS_WATCH_RUN) return 0;
     VS_WATCH_RUN = 1;
     pthread_t t;

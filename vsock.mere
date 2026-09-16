@@ -1,6 +1,6 @@
 import "virtio.mere";
 
-// vsock.mere — virtio-vsock: one stream between the guest and a host socket.
+// vsock.mere — virtio-vsock: streams between the guest and host sockets.
 //
 // WHY THIS DEVICE. The host and the guest have to talk, and the two obvious
 // ways do not work here: virtio-net needs vmnet.framework, whose
@@ -10,15 +10,21 @@ import "virtio.mere";
 // the guest kernel already has it -- as three modules rather than built in,
 // which is a fact about the initramfs and not about the device.
 //
-// WHAT IT IS. Device id 19 on the same virtio-mmio transport as the block
-// device, at its own window and its own SPI. Three queues -- rx, tx, event --
-// and the guest's end of a stream is a virtqueue while the host's end is an
-// ordinary AF_UNIX socket, so what the guest connects to is a real program.
+// WHAT IT IS. Device id 19 on its own virtio-mmio window with its own SPI.
+// Three queues -- rx, tx, event -- and a table of streams. A stream's guest
+// end is a virtqueue and its host end is an ordinary AF_UNIX socket, so what
+// is at the other end is a real program either way:
 //
-// WHAT IT REFUSES. One stream at a time; SEQPACKET is not offered; a second
-// REQUEST while a stream is open is answered RST rather than queued. Those are
-// refusals, not gaps to be filled in silently later: each one is a packet the
-// guest can see, not a case that falls through to zero.
+//   outward   the guest connects; the VMM connects to the path in MVM_VSOCK
+//   inward    a host program connects to the path in MVM_VSOCK_IN; the VMM
+//             starts the handshake toward a port the guest is listening on
+//
+// The inward direction is not the outward one with the arguments swapped: the
+// VMM is the side that has to send REQUEST, on a queue the guest fills for it.
+//
+// WHAT IT REFUSES. SEQPACKET is not offered. More streams than the table holds
+// are refused by name. Anything else is answered RST rather than ignored --
+// each refusal is a packet the guest can see, not a case that falls through.
 
 extern fn hv_read_u32: str -> int;
 extern fn hv_write_u32: str -> int -> int;
@@ -26,54 +32,78 @@ extern fn hv_write_u16: str -> int -> int;
 extern fn hv_write_u64: str -> str -> int;
 extern fn hv_spi: int -> int -> int;
 extern fn hv_vs_connect: str -> int;
+extern fn hv_vs_listen: str -> int;
+extern fn hv_vs_accept: unit -> int;
 extern fn hv_vs_close: int -> int;
 extern fn hv_vs_send: int -> str -> int -> int;
 extern fn hv_vs_recv: int -> str -> int -> int;
 extern fn hv_vs_ready: int -> int;
-extern fn hv_vs_wake_on: int -> int;
+extern fn hv_vs_wake: unit -> int;
 
 let vs_base = 0xa000200;
 let vs_intid = 49;                  // SPI 17 in the device tree, which is 32+17
 let vs_qmax = 64;
 let vs_cid_host = 2;                // fixed by the specification
 let vs_cid_guest = 3;               // the first cid a guest is allowed
-let vs_hdr = 44;                    // src_cid dst_cid src_port dst_port len type op flags buf_alloc fwd_cnt
+let vs_hdr = 44;                    // the packet header, by the specification's layout
 let vs_buf_alloc = 262144;          // what this end claims it can hold
 
 let vs_type_stream = 1;
 let op_request = 1; let op_response = 2; let op_rst = 3; let op_shutdown = 4;
 let op_rw = 5; let op_credit_update = 6; let op_credit_request = 7;
 
-// State. Five device-wide slots, then six per queue, because three queues
-// means three descriptor tables and one field cannot hold three addresses.
+// ---- state ----------------------------------------------------------------
+//
+// Five device-wide slots, then six per queue -- three queues means three
+// descriptor tables, and a field that holds one address cannot answer for
+// three -- then a table of streams.
+
 let vs_dfsel = 0; let vs_drvfsel = 1; let vs_qsel = 2; let vs_status = 3; let vs_isr = 4;
 let vs_qfirst = 5; let vs_qstride = 6;
-let vs_handle = 23;      // the host socket, or -1
-let vs_gport = 24;       // the guest's port on the open stream
-let vs_hport = 25;       // ours
-let vs_fwd = 26;         // bytes taken from the guest, which is its credit back
-let vs_peer_alloc = 27;  // what the guest says it can hold
-let vs_peer_fwd = 28;    // what the guest says it has taken
-let vs_sent = 29;        // bytes handed to the guest
-let vs_isr_reads = 30;   // how many times the guest has read this device's ISR
-let vs_polls = 31;       // how many times the host end has been asked
-let vs_state_n = 32;
+let vs_isr_reads = 23;   // how many times the guest has read this device's ISR
+let vs_polls = 24;       // how many times the host end has been asked
+let vs_next_hport = 25;  // this end's port for the next inward stream
+let vs_in_port = 26;     // the guest port inward connections are handed to
+let vs_sfirst = 27; let vs_sstride = 8; let vs_smax = 8;
+let vs_state_n = 27 + 8 * 8;
+
+// A stream's fields, and its state: free, waiting for the guest to answer a
+// REQUEST this end sent, or open.
+let s_handle = 0; let s_gport = 1; let s_hport = 2; let s_fwd = 3;
+let s_sent = 4; let s_alloc = 5; let s_pfwd = 6; let s_st = 7;
+let st_free = 0; let st_waiting = 1; let st_open = 2;
+
+let sf = fn (i: int) -> fn (f: int) -> vs_sfirst + i * vs_sstride + f;
+let sget = fn (s) -> fn (i: int) -> fn (f: int) -> (vec_get s (sf i f) : int);
+let sset = fn (s) -> fn (i: int) -> fn (f: int) -> fn (v: int) -> vec_set s (sf i f) v;
 
 let vs_new = fn (u: unit) ->
   let v = vec_new () in
   let rec fill = fn (i: int) ->
     if i == vs_state_n then () else let _ = vec_push v 0 in fill (i + 1) in
   let _ = fill 0 in
-  let _ = vec_set v vs_handle (0 - 1) in
-  let _ = vec_set v vs_peer_alloc vs_buf_alloc in
+  let rec clear = fn (i: int) ->
+    if i == vs_smax then ()
+    else
+      let _ = vec_set v (vs_sfirst + i * vs_sstride + s_handle) (0 - 1) in
+      let _ = vec_set v (vs_sfirst + i * vs_sstride + s_st) st_free in
+      clear (i + 1) in
+  let _ = clear 0 in
+  let _ = vec_set v vs_next_hport 49152 in
+  let _ = vec_set v vs_in_port 1024 in
+  // The thread that wakes the vCPU is part of the device, not part of one
+  // direction. Starting it when an outward stream opens left it unstarted for
+  // a VMM that only listens, and moving it to the listening path left it
+  // unstarted for one that only connects out -- the same bug twice, once in
+  // each direction, because it was attached to an event rather than to the
+  // device coming up.
+  let _ = hv_vs_wake () in
   v;
 
-// Per-queue fields, by name rather than by arithmetic at each use.
 let q_num = 0; let q_ready = 1; let q_desc = 2; let q_avail = 3; let q_used = 4; let q_last = 5;
 let qf = fn (q: int) -> fn (f: int) -> vs_qfirst + q * vs_qstride + f;
 let qget = fn (s) -> fn (q: int) -> fn (f: int) -> (vec_get s (qf q f) : int);
 let qset = fn (s) -> fn (q: int) -> fn (f: int) -> fn (v: int) -> vec_set s (qf q f) v;
-
 let q_rx = 0; let q_tx = 1; let q_ev = 2;
 
 let vs_tracing = fn (u: unit) ->
@@ -81,11 +111,36 @@ let vs_tracing = fn (u: unit) ->
   | Some v -> str_len v > 0
   | _ -> false;
 
+// A stream is named by the pair of ports, not by either alone: the guest may
+// have several streams to the same port of ours and several of ours to the
+// same port of its.
+let vs_find = fn (s) -> fn (gport: int) -> fn (hport: int) ->
+  let rec go = fn (i: int) ->
+    if i == vs_smax then 0 - 1
+    else if sget s i s_st != st_free && sget s i s_gport == gport && sget s i s_hport == hport
+    then i else go (i + 1) in
+  go 0;
+
+let vs_alloc = fn (s) ->
+  let rec go = fn (i: int) ->
+    if i == vs_smax then 0 - 1
+    else if sget s i s_st == st_free then i else go (i + 1) in
+  go 0;
+
+let vs_release = fn (s) -> fn (i: int) ->
+  let h = sget s i s_handle in
+  let _ = if h >= 0 then (let _ = hv_vs_close h in ()) else () in
+  let _ = sset s i s_handle (0 - 1) in
+  let _ = sset s i s_st st_free in
+  let _ = sset s i s_fwd 0 in
+  let _ = sset s i s_sent 0 in
+  0;
+
 // ---- packets --------------------------------------------------------------
 
-// The header this end writes. The two cids are 64-bit, which is why they go
-// through hv_write_u64 rather than two halves: an address or an identifier
-// split across two calls is two chances to write one of them and not the other.
+// The two cids are 64-bit, which is why they go through one call rather than
+// two halves: an identifier split across two writes is two chances to write
+// one of them and not the other.
 let vs_put_hdr = fn (a: int) -> fn (src_port: int) -> fn (dst_port: int)
               -> fn (len: int) -> fn (op: int) -> fn (flags: int) -> fn (fwd: int) ->
   let _ = hv_write_u64 (hexs a) (hexs vs_cid_host) in
@@ -125,8 +180,10 @@ let vs_rx_done = fn (s) -> fn (head: int) -> fn (len: int) ->
   let _ = hv_spi vs_intid 1 in
   0;
 
-// A packet with no payload: RESPONSE, RST, SHUTDOWN, CREDIT_UPDATE.
-let vs_ctl = fn (s) -> fn (op: int) -> fn (flags: int) ->
+// A packet with no payload, addressed by ports rather than by a stream:
+// a refusal has to be sendable for a stream this end declined to create.
+let vs_ctl_ports = fn (s) -> fn (src_port: int) -> fn (dst_port: int)
+                -> fn (op: int) -> fn (flags: int) -> fn (fwd: int) ->
   let head = vs_rx_take s in
   if head < 0 then
     // Named, not swallowed. "The guest posted no receive buffer" and "the
@@ -134,7 +191,6 @@ let vs_ctl = fn (s) -> fn (op: int) -> fn (flags: int) ->
     // and only this end can tell them apart.
     let _ = print_err ("mvm: vsock could not send op " ++ show op
                     ++ ": no rx buffer (qnum " ++ show (qget s q_rx q_num)
-                    ++ " avail " ++ show (qget s q_rx q_avail)
                     ++ " ready " ++ show (qget s q_rx q_ready) ++ ")") in
     0 - 1
   else
@@ -144,34 +200,26 @@ let vs_ctl = fn (s) -> fn (op: int) -> fn (flags: int) ->
     if l < vs_hdr then
       let _ = print_err ("mvm: vsock rx buffer is " ++ show l ++ " bytes, shorter than a header") in 0 - 1
     else
-      let _ = vs_put_hdr a (vec_get s vs_hport : int) (vec_get s vs_gport : int)
-                           0 op flags (vec_get s vs_fwd : int) in
+      let _ = vs_put_hdr a src_port dst_port 0 op flags fwd in
       let _ = if vs_tracing () then
-                print_err ("mvm: vsock sent op " ++ show op ++ " into desc " ++ show head
-                        ++ " at " ++ hexs a ++ " len " ++ show l
-                        ++ " (rx tbl " ++ hexs tbl ++ " used " ++ hexs (qget s q_rx q_used)
-                        ++ " uidx " ++ show (hv_read_u16 (hexs (qget s q_rx q_used + 2)))
-                        ++ ") isr reads so far " ++ show (vec_get s vs_isr_reads : int))
-              else () in
+                print_err ("mvm: vsock sent op " ++ show op ++ " port " ++ show src_port
+                        ++ " to " ++ show dst_port) else () in
       let _ = vs_rx_done s head vs_hdr in
       0;
 
-// Whatever the host has said, up to one buffer's worth and up to the credit
-// the guest has advertised. Returns the number of payload bytes, 0 for "the
-// host has nothing to say yet", or -2 when the host end has closed.
-let vs_pump_one = fn (s) ->
-  let h = (vec_get s vs_handle : int) in
+// The same, for a stream that exists.
+let vs_ctl = fn (s) -> fn (i: int) -> fn (op: int) -> fn (flags: int) ->
+  vs_ctl_ports s (sget s i s_hport) (sget s i s_gport) op flags (sget s i s_fwd);
+
+// Whatever the host end of one stream has said, up to one buffer's worth and
+// up to the credit the guest has advertised.
+let vs_pump_one = fn (s) -> fn (i: int) ->
+  let h = sget s i s_handle in
   let _ = vec_set s vs_polls ((vec_get s vs_polls : int) + 1) in
-  if h < 0 then 0
+  if h < 0 || sget s i s_st != st_open then 0
   else if hv_vs_ready h == 0 then 0
   else
     let head = vs_rx_take s in
-    let _ = if vs_tracing () then
-              print_err ("mvm: vsock pump: host ready, rx head " ++ show head
-                      ++ " peer_alloc " ++ show (vec_get s vs_peer_alloc : int)
-                      ++ " sent " ++ show (vec_get s vs_sent : int)
-                      ++ " peer_fwd " ++ show (vec_get s vs_peer_fwd : int))
-            else () in
     if head < 0 then 0
     else
       let tbl = qget s q_rx q_desc in
@@ -182,42 +230,88 @@ let vs_pump_one = fn (s) ->
         // What the guest has room for: what it said it can hold, less what it
         // has been sent and not yet taken. Ignoring this is how a device
         // overruns a driver that was telling it not to.
-        let room = (vec_get s vs_peer_alloc : int)
-                 - ((vec_get s vs_sent : int) - (vec_get s vs_peer_fwd : int)) in
+        let room = sget s i s_alloc - (sget s i s_sent - sget s i s_pfwd) in
         let cap = if l - vs_hdr < room then l - vs_hdr else room in
         if cap <= 0 then 0
         else
           let n = hv_vs_recv h (hexs (a + vs_hdr)) cap in
           if n > 0 then
-            let _ = vs_put_hdr a (vec_get s vs_hport : int) (vec_get s vs_gport : int)
-                                 n op_rw 0 (vec_get s vs_fwd : int) in
-            let _ = vec_set s vs_sent ((vec_get s vs_sent : int) + n) in
+            let _ = vs_put_hdr a (sget s i s_hport) (sget s i s_gport)
+                                 n op_rw 0 (sget s i s_fwd) in
+            let _ = sset s i s_sent (sget s i s_sent + n) in
             let _ = vs_rx_done s head (vs_hdr + n) in
             n
           else if n == 0 - 2 then
             // End of file on the host end. The guest is told so with a
             // SHUTDOWN in both directions, which is what makes its read()
-            // return 0 instead of hanging on a stream nobody will ever fill.
-            let _ = vs_put_hdr a (vec_get s vs_hport : int) (vec_get s vs_gport : int)
-                                 0 op_shutdown 3 (vec_get s vs_fwd : int) in
+            // return 0 instead of waiting on a stream nobody will ever fill.
+            let _ = vs_put_hdr a (sget s i s_hport) (sget s i s_gport)
+                                 0 op_shutdown 3 (sget s i s_fwd) in
             let _ = vs_rx_done s head vs_hdr in
             let _ = hv_vs_close h in
-            let _ = vec_set s vs_handle (0 - 1) in
+            let _ = sset s i s_handle (0 - 1) in
             0 - 2
           else 0;
 
-// Drain, not one buffer per wake. A reply larger than one receive buffer is
-// the normal case, and handing over one buffer per wake-up makes the stream's
-// speed a property of how often the watching thread happens to poll.
-let vs_pump = fn (s) ->
-  let rec go = fn (total: int) -> fn (guard: int) ->
-    if guard == 0 then total
+// A host program waiting to be let in. The VMM starts the handshake, which is
+// what makes this the other direction rather than the same one reversed.
+let vs_accept = fn (s) ->
+  if (vec_get s vs_in_port : int) == 0 then 0
+  else
+    let h = hv_vs_accept () in
+    if h == 0 - 2 then
+      let _ = print_err ("mvm: vsock refused an inward connection: all "
+                      ++ show vs_smax ++ " streams are in use") in 0
+    else if h < 0 then 0
     else
-      let n = vs_pump_one s in
-      if n > 0 then go (total + n) (guard - 1) else total in
-  go 0 4096;
+      let i = vs_alloc s in
+      if i < 0 then
+        let _ = print_err "mvm: vsock refused an inward connection: no free stream" in
+        let _ = hv_vs_close h in 0
+      else
+        let hp = (vec_get s vs_next_hport : int) in
+        let gp = (vec_get s vs_in_port : int) in
+        let _ = vec_set s vs_next_hport (hp + 1) in
+        let _ = sset s i s_handle h in
+        let _ = sset s i s_gport gp in
+        let _ = sset s i s_hport hp in
+        let _ = sset s i s_fwd 0 in
+        let _ = sset s i s_sent 0 in
+        let _ = sset s i s_alloc vs_buf_alloc in
+        let _ = sset s i s_pfwd 0 in
+        let _ = sset s i s_st st_waiting in
+        let _ = print_err ("mvm: vsock inward stream, host port " ++ show hp
+                        ++ " to guest port " ++ show gp) in
+        if vs_ctl s i op_request 0 < 0 then
+          // The guest is not ready to be told anything -- its driver may not
+          // be up yet, which is the normal case for a host that connects
+          // early. Keeping the stream would hold a slot and an open host
+          // socket for a handshake that was never started; there are eight
+          // slots, so eight early connections would leave no room for the
+          // ninth, which is the one that would have worked. Let it go and let
+          // the host try again.
+          let _ = vs_release s i in
+          let _ = print_err "mvm: vsock dropped that inward stream; the guest was not ready" in 0
+        else 1;
 
-// ---- the guest's side of the stream ---------------------------------------
+// Drain, not one buffer per wake, and every stream rather than one. A reply
+// larger than one receive buffer is the normal case, and handing over one
+// buffer per wake-up makes the stream's speed a property of how often a thread
+// happens to poll.
+let vs_pump = fn (s) ->
+  let _ = vs_accept s in
+  let rec sweep = fn (i: int) -> fn (moved: int) ->
+    if i == vs_smax then moved
+    else
+      let rec drain = fn (total: int) -> fn (guard: int) ->
+        if guard == 0 then total
+        else
+          let n = vs_pump_one s i in
+          if n > 0 then drain (total + n) (guard - 1) else total in
+      sweep (i + 1) (moved + drain 0 4096) in
+  sweep 0 0;
+
+// ---- the guest's side of a stream -----------------------------------------
 
 let vs_tx_one = fn (s) -> fn (path: str) -> fn (head: int) ->
   let tbl = qget s q_tx q_desc in
@@ -230,8 +324,8 @@ let vs_tx_one = fn (s) -> fn (path: str) -> fn (head: int) ->
     let dst_port = hv_read_u32 (hexs (a0 + 20)) in
     let plen = hv_read_u32 (hexs (a0 + 24)) in
     let op = hv_read_u16 (hexs (a0 + 30)) in
-    let _ = vec_set s vs_peer_alloc (hv_read_u32 (hexs (a0 + 36))) in
-    let _ = vec_set s vs_peer_fwd (hv_read_u32 (hexs (a0 + 40))) in
+    let alloc = hv_read_u32 (hexs (a0 + 36)) in
+    let pfwd = hv_read_u32 (hexs (a0 + 40)) in
     // The payload is the rest of this descriptor, or the next one in the
     // chain. Linux sends the header and the data as separate entries; a
     // driver that inlines them is also legal, so both are read.
@@ -239,59 +333,74 @@ let vs_tx_one = fn (s) -> fn (path: str) -> fn (head: int) ->
     let pa = if l0 > vs_hdr then a0 + vs_hdr
              else if has_next then d_addr tbl (d_next tbl head)
              else 0 in
-    let is_open = (vec_get s vs_handle : int) >= 0 in
+    let i = vs_find s src_port dst_port in
+    let _ = if i >= 0 then
+              (let _ = sset s i s_alloc alloc in let _ = sset s i s_pfwd pfwd in ())
+            else () in
     if op == op_request then
-      (if is_open then
-         // One stream at a time. A second request is refused by name rather
-         // than queued behind the first, because a queue that is not there
-         // cannot be the thing that is tested.
-         let _ = vec_set s vs_gport src_port in
-         let _ = vec_set s vs_hport dst_port in
-         let _ = vs_ctl s op_rst 0 in 0
+      // Outward: the guest is asking for a stream to a host path.
+      (if i >= 0 then let _ = vs_ctl s i op_rst 0 in 0
+       else if str_len path == 0 then
+         let _ = print_err ("mvm: vsock port " ++ show dst_port
+                         ++ ": this VMM was given no outward path") in
+         let _ = vs_ctl_ports s dst_port src_port op_rst 0 0 in 0
        else
-         let h = hv_vs_connect path in
-         let _ = vec_set s vs_gport src_port in
-         let _ = vec_set s vs_hport dst_port in
-         let _ = vec_set s vs_fwd 0 in
-         let _ = vec_set s vs_sent 0 in
-         if h < 0 then
-           let _ = print_err ("mvm: vsock port " ++ show dst_port ++ ": nothing listening at " ++ path) in
-           let _ = vs_ctl s op_rst 0 in 0
+         let j = vs_alloc s in
+         if j < 0 then
+           let _ = print_err ("mvm: vsock refused an outward stream: all "
+                           ++ show vs_smax ++ " streams are in use") in
+           let _ = vs_ctl_ports s dst_port src_port op_rst 0 0 in 0
          else
-           let _ = vec_set s vs_handle h in
-           // From here the host may speak at any time, and the vCPU is the
-           // thread that would have to notice. It cannot: it is inside run().
-           let _ = hv_vs_wake_on h in
-           let _ = print_err ("mvm: vsock stream open, guest port "
-                           ++ show (bit_and src_port 0xffffffff)
-                           ++ " to port " ++ show dst_port) in
-           let _ = vs_ctl s op_response 0 in 0)
+           let h = hv_vs_connect path in
+           if h < 0 then
+             let _ = print_err ("mvm: vsock port " ++ show dst_port
+                             ++ ": nothing listening at " ++ path) in
+             let _ = vs_ctl_ports s dst_port src_port op_rst 0 0 in 0
+           else
+             let _ = sset s j s_handle h in
+             let _ = sset s j s_gport src_port in
+             let _ = sset s j s_hport dst_port in
+             let _ = sset s j s_fwd 0 in
+             let _ = sset s j s_sent 0 in
+             let _ = sset s j s_alloc alloc in
+             let _ = sset s j s_pfwd pfwd in
+             let _ = sset s j s_st st_open in
+             let _ = print_err ("mvm: vsock outward stream, guest port "
+                             ++ show (bit_and src_port 0xffffffff)
+                             ++ " to port " ++ show dst_port) in
+             let _ = vs_ctl s j op_response 0 in 0)
+    else if i < 0 then
+      // A packet for a stream this end does not have. Answered rather than
+      // dropped: a guest waiting on a stream nobody owns waits forever.
+      (if op == op_rst then 0 else let _ = vs_ctl_ports s dst_port src_port op_rst 0 0 in 0)
+    else if op == op_response then
+      // Inward: the guest accepted the connection this end asked for.
+      (let _ = sset s i s_st st_open in
+       let _ = print_err ("mvm: vsock inward stream accepted by the guest on port "
+                       ++ show dst_port) in 0)
     else if op == op_rw then
-      (if is_open == false then let _ = vs_ctl s op_rst 0 in 0
+      (if sget s i s_st != st_open then let _ = vs_ctl s i op_rst 0 in 0
        else if pa == 0 then 0
        else
-         let n = hv_vs_send (vec_get s vs_handle : int) (hexs pa) plen in
+         let n = hv_vs_send (sget s i s_handle) (hexs pa) plen in
          if n < 0 then
            let _ = print_err "mvm: vsock host write failed" in
-           let _ = vs_ctl s op_rst 0 in 0
+           let _ = vs_ctl s i op_rst 0 in
+           let _ = vs_release s i in 0
          else
            // Credit back. The guest stops sending when it thinks this end is
            // full, so the count of what has been taken has to keep moving.
-           let _ = vec_set s vs_fwd ((vec_get s vs_fwd : int) + n) in
-           let _ = vs_ctl s op_credit_update 0 in 0)
-    else if op == op_credit_request then let _ = vs_ctl s op_credit_update 0 in 0
-    else if op == op_shutdown then
-      (let _ = if is_open then (let _ = hv_vs_close (vec_get s vs_handle : int) in ()) else () in
-       let _ = vec_set s vs_handle (0 - 1) in
-       let _ = vs_ctl s op_rst 0 in 0)
-    else if op == op_rst then
-      (let _ = if is_open then (let _ = hv_vs_close (vec_get s vs_handle : int) in ()) else () in
-       let _ = vec_set s vs_handle (0 - 1) in 0)
-    else if op == op_response then 0
+           let _ = sset s i s_fwd (sget s i s_fwd + n) in
+           let _ = vs_ctl s i op_credit_update 0 in 0)
+    else if op == op_credit_request then let _ = vs_ctl s i op_credit_update 0 in 0
     else if op == op_credit_update then 0
+    else if op == op_shutdown then
+      (let _ = vs_ctl s i op_rst 0 in let _ = vs_release s i in 0)
+    else if op == op_rst then
+      (let _ = vs_release s i in 0)
     else
       let _ = print_err ("mvm: vsock refused op " ++ show op) in
-      let _ = vs_ctl s op_rst 0 in 0;
+      let _ = vs_ctl s i op_rst 0 in 0;
 
 // A queue the guest has notified. tx is where the work is; rx and event are
 // buffers being posted, and posting is not something to consume.
@@ -323,6 +432,23 @@ let vs_notify = fn (s) -> fn (path: str) -> fn (q: int) ->
       let _ = vs_pump s in
       done;
 
+let vs_polls_of = fn (s) -> (vec_get s vs_polls : int);
+
+// Start listening for inward connections. Separate from vs_new because it can
+// fail, and a VMM that cannot open the socket it was asked for should say so
+// rather than run as if it had.
+let vs_listen = fn (s) -> fn (path: str) -> fn (gport: int) ->
+  if str_len path == 0 then 0
+  else
+    let r = hv_vs_listen path in
+    if r != 0 then
+      let _ = print_err ("mvm: vsock could not listen at " ++ path) in 0 - 1
+    else
+      let _ = vec_set s vs_in_port gport in
+      let _ = print_err ("mvm: vsock listening at " ++ path
+                      ++ " for guest port " ++ show gport) in
+      0;
+
 // ---- the transport registers ----------------------------------------------
 
 let vs_read = fn (s) -> fn (off: int) ->
@@ -344,8 +470,6 @@ let vs_read = fn (s) -> fn (off: int) ->
   else if off == 0x100 then vs_cid_guest          // guest_cid, low word
   else if off == 0x104 then 0                     // and high
   else 0;
-
-let vs_pumps = fn (s) -> (vec_get s vs_polls : int);
 
 let vs_write = fn (s) -> fn (path: str) -> fn (off: int) -> fn (v: int) ->
   let q = (vec_get s vs_qsel : int) in

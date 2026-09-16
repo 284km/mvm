@@ -1,2 +1,6 @@
 .build/
-guest/vsock_client
+# Only the sources in guest/ are tracked. The binaries there are built for the
+# guest by a container and are the wrong architecture for this machine, so
+# naming each one would mean remembering to name the next one too.
+guest/*
+!guest/*.c
