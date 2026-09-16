@@ -332,6 +332,31 @@ out, and one signed by an authority the guest does not have — which is refused
 and nothing from it reaches the store. The third needs its own authority, which
 is why `tools/make-certs.sh` makes two.
 
+## Out to somewhere it cannot name
+
+```
+$ docker -H unix://.build/docker.sock pull docker.io/library/alpine:latest
+docker.io/library/alpine:latest
+$ docker -H unix://.build/docker.sock run docker.io/library/alpine:latest echo ok
+ok
+```
+
+That is Docker Hub, from a guest with **no network interface at all**. Every
+byte went over one vsock route, to `mproxy` on this machine — a CONNECT proxy,
+because a route table cannot follow a name it was never given, and Hub
+redirects blobs to a content network whose host nobody knows when the machine
+starts. Something that can be *told* the name can.
+
+The proxy sees the name in the CONNECT line and **ciphertext after it**: the
+guest's TLS is end to end with the real host, through the tunnel. That is the
+whole difference between this and letting something on this side terminate TLS
+on the guest's behalf. It binds the loopback, because what is on the other end
+is a virtual machine asking to reach the internet.
+
+`test/hub.sh` is the check, and it needs the internet — it **fails rather than
+skips** without it. Its oracle is not this stack: the config digest of the
+arm64 manifest out of what `docker` downloaded for the same reference.
+
 ## Three programs and one number
 
 A published port needs all three, and each knows something the others cannot:
@@ -363,14 +388,9 @@ it opens and closes host ports, and who wanted one is the caller's business.
 ports. Two VMs would need the control socket to say which — and that is the
 first thing here that would benefit from a name rather than a number.
 
-**A way out to somewhere the guest cannot name in advance.** An outward route
-now reaches `tcp:<host>:<port>` — this machine resolves the name and connects —
-and that is enough for a registry whose address is known when the VM starts.
-It is not enough for Docker Hub: the daemon can pull from it (mengd's
-`test/hub.sh` does, with the token dance and all), but blobs are redirected to
-a content network whose host nobody knows beforehand, and a static route table
-cannot follow that. What that wants is a proxy on this side, spoken to by
-name — which is a program, not a table.
+**More than one machine's worth**, and **`docker build`**. The stack pulls,
+runs, publishes ports and answers compose; it cannot build an image, and
+`POST /build` says so by name.
 
 The language change this project expected never arrived. `Raw`, Mere's window
 type for physical memory, was going to need a second source so that a virtio

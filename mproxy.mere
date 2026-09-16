@@ -1,0 +1,124 @@
+// mproxy.mere — a CONNECT proxy, so the guest can reach a host it cannot name
+// in advance.
+//
+// WHY A PROGRAM RATHER THAN A TABLE. MVM_VSOCK_OUT maps a guest vsock port to
+// an address decided when the machine starts. That is enough for a registry
+// whose address is known then, and it is not enough for a registry that
+// REDIRECTS: Docker Hub serves blobs from a content network whose host nobody
+// knows beforehand. A route cannot follow a name it was never given. Something
+// that can be TOLD the name can.
+//
+// WHAT IT DOES NOT SEE. The client's TLS is end to end: it hands over the name
+// in the CONNECT line and then does its own handshake with the real host
+// through this. Everything after the first line is ciphertext here, which is
+// the whole difference between this and terminating TLS on the host's side.
+//
+//   mproxy <port>
+//
+// It binds the loopback. What is on the other end of this is a virtual machine
+// asking to reach the internet, and that is not something to offer whatever
+// network this machine happens to be on.
+
+extern fn px_listen: int -> int;
+extern fn px_accept: int -> int;
+extern fn px_close: int -> int;
+extern fn px_line: int -> str;
+extern fn px_write: int -> str -> int;
+extern fn px_connect: str -> int -> int;
+extern fn px_pipe: int -> int -> int;
+
+// The last occurrence, for splitting "host:port" -- an IPv6 literal has
+// colons of its own, and the port is after the last one.
+let last_colon = fn (t: str) ->
+  let n = str_len t in
+  let rec go = fn (i: int) -> fn (best: int) ->
+    if i == n then best
+    else go (i + 1) (if char_at t i == ":" then i else best) in
+  go 0 (0 - 1);
+
+// A number, or 0. int_of_str stops the program on anything that is not one,
+// and this came off a socket.
+let num_or0 = fn (t: str) ->
+  let n = str_len t in
+  if n == 0 then 0
+  else
+    let rec go = fn (i: int) -> fn (acc: int) ->
+      if i == n then acc
+      else
+        let c = ord (char_at t i) in
+        if c < 48 || c > 57 then 0 - 1 else go (i + 1) (acc * 10 + (c - 48)) in
+    let v = go 0 0 in
+    if v < 0 then 0 else v;
+
+let tracing = fn (u: unit) ->
+  match env_var "MPROXY_TRACE" with
+  | Some v -> str_len v > 0
+  | _ -> false;
+
+// "CONNECT host:port HTTP/1.1" -> ("host", port). Anything else is ("", 0),
+// which is refused by name rather than guessed at: this speaks one verb.
+let parse_connect = fn (line: str) ->
+  let sp1 = str_index_of line " " in
+  if sp1 < 0 || substring line 0 sp1 != "CONNECT" then ("", 0)
+  else
+    let rest = substring line (sp1 + 1) (str_len line) in
+    let sp2 = str_index_of rest " " in
+    let target = if sp2 < 0 then rest else substring rest 0 sp2 in
+    let c = last_colon target in
+    if c < 0 then ("", 0)
+    else
+      let h = substring target 0 c in
+      let p = num_or0 (substring target (c + 1) (str_len target)) in
+      if str_len h == 0 || p <= 0 || p > 65535 then ("", 0) else (h, p);
+
+// The headers after the request line, read and dropped. A client may send
+// them and a proxy that left them in the stream would hand them to the far
+// side as if they were part of the tunnel.
+let drain_headers = fn (c: int) ->
+  let rec go = fn (n: int) ->
+    if n == 0 then ()
+    else let l = px_line c in if str_len l == 0 then () else go (n - 1) in
+  go 64;
+
+let serve_one = fn (c: int) ->
+  let line = px_line c in
+  let (h, p) = parse_connect line in
+  if str_len h == 0 then
+    let _ = if tracing () then print_err ("mproxy: refused " ++ line) else () in
+    let _ = px_write c "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n" in
+    let _ = px_close c in ()
+  else
+    let _ = drain_headers c in
+    let up = px_connect h p in
+    if up < 0 then
+      // Named: "no such host" and "nothing listening there" are different
+      // facts, and the client can do something about the first.
+      let _ = print_err ("mproxy: cannot reach " ++ h ++ ":" ++ show p
+                      ++ (if up == 0 - 2 then " (no such host)" else " (nothing listening)")) in
+      let _ = px_write c "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n" in
+      let _ = px_close c in ()
+    else
+      let _ = if tracing () then print_err ("mproxy: " ++ h ++ ":" ++ show p) else () in
+      let _ = px_write c "HTTP/1.1 200 Connection Established\r\n\r\n" in
+      let _ = px_pipe c up in
+      ();
+
+let serve = fn (port: int) ->
+  let srv = px_listen port in
+  let _ = if srv < 0 then
+            let _ = print_err ("mproxy: cannot listen on 127.0.0.1:" ++ show port) in exit 1
+          else () in
+  let _ = print_err ("mproxy on 127.0.0.1:" ++ show port) in
+  let rec loop = fn (u: unit) ->
+    let c = px_accept srv in
+    if c < 0 then loop ()
+    else
+      // A thread per connection: px_pipe runs until both directions have
+      // ended, so a serial loop would serve one caller ever.
+      let _ = spawn (fn (x: unit) -> let _ = serve_one c in ()) in
+      loop () in
+  loop ();
+
+match args () with
+| [port] -> serve (int_of_str port)
+| _ -> let _ = print_err "usage: mproxy <port>" in exit 2

@@ -69,6 +69,10 @@ fi
 # certificate for.
 [ -r /opt/ca.pem ] && export MENGD_CA=/opt/ca.pem
 [ -n "${MENGD_INSECURE:-}" ] && export MENGD_INSECURE
+# A proxy to reach anything this machine cannot name in advance. There is no
+# route out of here at all, so a registry that redirects to a content network
+# is unreachable without one.
+[ -n "${MENGD_PROXY:-}" ] && export MENGD_PROXY
 
 MENGD_TRACE=1 /opt/mengd vsock://1024 /var/lib/mengd /usr/local/bin/mrun \
     >> /var/log/mengd.log 2>&1
