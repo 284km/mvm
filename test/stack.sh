@@ -434,7 +434,12 @@ if [ -r "$out/initrd-mengd.gz" ]; then
   d load -i "$out/alpine.tar" >/dev/null 2>&1; say $? "and still loads an image"
   d run --network host alpine:latest echo should-not-appear >/dev/null 2>&1
   pcid=$(d ps -aq 2>/dev/null | head -1)
-  perr=$(d logs "$pcid" 2>&1 | head -1)
+  # The WHOLE output, not its first line: the runtime says everything it could
+  # not do, in order, and on this machine there is more than one -- an
+  # initramfs has no cgroup2 either, and that warning arrived first. A check
+  # that reads only the first line asks "what went wrong FIRST", which is not
+  # the question.
+  perr=$(d logs "$pcid" 2>&1 | tr "\n" " ")
   case "$perr" in *pivot_root*) echo "  ok    but the runtime cannot enter a container ($perr)";;
                   *) echo "  FAIL  expected a pivot_root refusal, got: $perr"; fail=1;; esac
   stop_vm

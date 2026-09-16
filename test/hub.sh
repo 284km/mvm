@@ -127,6 +127,37 @@ mine=$(d images --format '{{.ID}}' 2>/dev/null | head -1)
 [ -n "$want" ] && [ "$want" = "$mine" ]
 say $? "the image id is the config digest docker downloaded for it ($mine vs $want)"
 
+# CAN THIS CLIENT BUILD AT ALL? Measured before it is relied on, because the
+# answer changed under this project's feet: on the macOS docker CLI 29.8.0,
+# `DOCKER_BUILDKIT=0 docker build` hangs forever with no output and no image --
+# against the REAL docker as well, so it is the client and not this daemon.
+# BuildKit works there and needs /session and a builder container, which is a
+# different daemon feature.
+#
+# A gate that cannot tell those apart would hang, and a hang says nothing. This
+# one asks the question against the host's own docker first, with a deadline,
+# and SKIPS by name if the answer is no.
+echo "== can this client drive a build at all =="
+mkdir -p "$out/probe-build"
+printf 'FROM alpine:latest\nRUN true\n' > "$out/probe-build/Dockerfile"
+( cd "$out/probe-build" && DOCKER_BUILDKIT=0 DOCKER_HOST= docker build -q -t mvm-probe:v1 . \
+    > "$out/probe-build.log" 2>&1 ) &
+pb=$!
+pi=0; while [ "$pi" -lt 30 ] && kill -0 "$pb" 2>/dev/null; do sleep 1; pi=$((pi + 1)); done
+if kill -0 "$pb" 2>/dev/null; then
+  kill "$pb" 2>/dev/null
+  wait "$pb" 2>/dev/null
+  CAN_BUILD=no
+  echo "  SKIP  this client's legacy builder does not finish, against ANY daemon"
+else
+  CAN_BUILD=yes
+  echo "  ok    the client can drive a legacy build"
+fi
+DOCKER_HOST= docker rmi mvm-probe:v1 >/dev/null 2>&1
+
+if [ "$CAN_BUILD" = no ]; then
+  echo "  SKIP  the build-through-the-VM checks (the client, not the daemon)"
+else
 echo "== a build whose steps need the network =="
 # The daemon reaching a registry and a CONTAINER reaching a package mirror are
 # different paths: one is the daemon's own socket, the other is a tool inside a
@@ -146,6 +177,7 @@ bo=$(d run --network host netbuild:v1 2>/dev/null | head -1)
 case "$bo" in *"Example Domain"*) echo "  ok    and the image it built has what it fetched";;                *) echo "  FAIL  the built image printed: $bo"; fail=1;; esac
 grep -q "mproxy: dl-cdn.alpinelinux.org:443" "$out/mproxy.log"
 say $? "the package mirror was reached through the proxy, not some other way"
+fi
 
 # What the proxy will NOT do, and says so. busybox's wget has no CONNECT: it
 # asks the proxy to fetch, which for https would mean this end doing the TLS

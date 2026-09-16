@@ -473,3 +473,29 @@ carries whatever earlier runs left in it, so "no containers left" has to mean
 **this project's** containers, and the HTTP server the test builds had to
 compute its own `Content-Length` correctly before the port check meant
 anything.
+
+## When the client is the thing that broke
+
+`mvm/test/app.sh` used to build its service through the VM with
+`compose up --build`. It stopped working, and the daemon was innocent: on this
+macOS docker CLI (29.8.0), **`DOCKER_BUILDKIT=0 docker build` hangs forever**,
+with no output and no image — *against the real docker as well*. The same build
+with BuildKit finishes instantly, and BuildKit wants `/session` and a builder
+container, which is a different daemon feature.
+
+Finding that took the same discipline as any other bug: the hang looked exactly
+like a daemon that had stopped answering, and the proof that it was not came
+from pointing the same command at a daemon nobody doubts.
+
+So `hub.sh` now **asks first**, with a deadline, and skips by name:
+
+```
+== can this client drive a build at all ==
+  SKIP  this client's legacy builder does not finish, against ANY daemon
+  SKIP  the build-through-the-VM checks (the client, not the daemon)
+```
+
+A gate that cannot tell "the daemon is broken" from "the client is broken"
+would hang, and a hang says nothing at all. The build path itself is still
+checked where the client is Linux and the legacy builder works — that is
+mengd's own gate, with COPY, ADD, the cache and one layer per step.
