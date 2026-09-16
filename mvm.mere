@@ -1,0 +1,86 @@
+// mvm.mere — P5.1. Can a Mere program drive Hypervisor.framework far enough
+// for the guest to execute one instruction?
+//
+// Two instructions, actually: put a known value in x0, then HVC, which traps
+// out of the guest. If the value comes back, the whole path works -- the VM
+// exists, memory is mapped where the guest expects it, the vCPU starts at EL1
+// rather than EL0, and the exit carries a syndrome that says why.
+//
+// 64-bit quantities cross the FFI as hex strings. The boundary's `int` is 32
+// bits, and an address that silently loses its top half is the kind of bug
+// that looks like the hypervisor refusing a valid mapping.
+
+extern fn hv_up: unit -> int;
+extern fn hv_map: str -> int -> int;
+extern fn hv_poke32: str -> int -> int;
+extern fn hv_peek32: str -> int;
+extern fn hv_vcpu_new: unit -> int;
+extern fn hv_set_x: int -> str -> int;
+extern fn hv_get_x: int -> str;
+extern fn hv_set_pc: str -> int;
+extern fn hv_get_pc: unit -> str;
+extern fn hv_set_cpsr: str -> int;
+extern fn hv_run: unit -> int;
+extern fn hv_exit_reason: unit -> int;
+extern fn hv_exit_syndrome: unit -> str;
+extern fn hv_exit_ec: unit -> int;
+
+let hex_of_int = fn (v: int) ->
+  let digits = "0123456789abcdef" in
+  let rec go = fn (n: int) -> fn (acc: str) ->
+    if n == 0 then acc else go (n / 16) (char_at digits (n % 16) ++ acc) in
+  if v == 0 then "0" else go v "";
+
+let ram_base = "0x40000000";
+let ram_size = 2097152;          // 2 MiB is plenty for two instructions
+
+// A hv_return_t of 0 is success; anything else is one of Apple's documented
+// codes and is reported as itself rather than folded into "failed".
+let must = fn (what: str) -> fn (rc: int) ->
+  if rc != 0 then
+    let _ = print_err ("mvm: " ++ what ++ " -> hv_return 0x" ++ show rc) in
+    exit 1
+  else 0;
+
+// movz x0, #imm16   ->  0xD2800000 | (imm16 << 5)
+let movz_x0 = fn (imm: int) -> bit_or 0xD2800000 (bit_shl imm 5);
+let hvc0 = 0xD4000002;
+
+// The value the guest is told to load is given from outside, so "the guest
+// ran" is a claim about THIS number rather than about a register that happened
+// to hold something. A run that always answered 42 would pass a test that only
+// ever asked for 42.
+let main = fn (want: int) ->
+  let _ = must "hv_vm_create" (hv_up ()) in
+  let _ = must "hv_vm_map" (hv_map ram_base ram_size) in
+
+  // The guest's first two instructions, written into its memory.
+  let _ = must "poke" (hv_poke32 "0x40000000" (movz_x0 want)) in
+  let _ = must "poke" (hv_poke32 "0x40000004" hvc0) in
+
+  let _ = must "hv_vcpu_create" (hv_vcpu_new ()) in
+  // EL1h, interrupts masked. Without setting this the vCPU starts at EL0 and
+  // the first instruction faults instead of running.
+  let _ = must "set cpsr" (hv_set_cpsr "0x3c5") in
+  let _ = must "set pc" (hv_set_pc ram_base) in
+
+  let rc = hv_run () in
+  let _ = must "hv_vcpu_run" rc in
+
+  let reason = hv_exit_reason () in
+  let ec = hv_exit_ec () in
+  let x0 = hv_get_x 0 in
+  let pc = hv_get_pc () in
+  let _ = print ("mvm.exit_reason=" ++ show reason) in
+  let _ = print ("mvm.exit_ec=" ++ show ec) in
+  let _ = print ("mvm.x0=" ++ x0) in
+  let _ = print ("mvm.pc=" ++ pc) in
+  // EC 0x16 is HVC from AArch64: the guest asked to leave, on purpose.
+  let want_hex = "0x" ++ hex_of_int want in
+  let _ = print ("mvm.want=" ++ want_hex) in
+  let _ = print (if x0 == want_hex then "mvm.guest-ran=yes" else "mvm.guest-ran=no") in
+  ();
+
+match args () with
+| [n] -> main (int_of_str n)
+| _ -> main 42
