@@ -20,8 +20,11 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 
 static hv_vcpu_t VCPU;
 static hv_vcpu_exit_t *EXIT;
@@ -42,9 +45,13 @@ static const char *put64(uint64_t v) { snprintf(strbuf, sizeof strbuf, "0x%" PRI
 int hv_up(void) { return (int)hv_vm_create(NULL); }
 
 /* Allocate host memory and map it as the guest's physical memory at `gpa`. */
-int hv_map(const char *gpa_hex, int size) {
+int hv_map(const char *gpa_hex, const char *size_hex) {
     if (RAM) return -2;
-    RAM_SIZE = (size_t)size;
+    /* The size crosses as hex for the same reason an address does: the FFI
+     * boundary's int is C's int, and a guest with 4 GiB of memory does not fit
+     * in one. It fitted while the guest was small, which is how a limit like
+     * this stays invisible until the day it matters. */
+    RAM_SIZE = (size_t)hex64(size_hex);
     RAM_GPA = hex64(gpa_hex);
     // No PROT_EXEC on the HOST mapping. On Apple Silicon an anonymous
     // executable mapping needs the JIT entitlement, and this one does not need
@@ -349,17 +356,38 @@ int hv_now_secs(void) { return (int)time(NULL); }
  * read has stopped being a VMM -- the vCPU is not running while it waits, and
  * a guest that is not running cannot be the one that fills the queue.
  */
-#define VS_MAX 8
+/* Streams. Eight was enough for one client at a time; a forwarded port holds
+ * one open for the life of every connection through it, and `docker compose
+ * up` with published ports has several at once. */
+#define VS_MAX 32
 static int VS_FD[VS_MAX];
 /* "The peer will send no more." Not the same as "the connection is over":
  * a host program that closes its write side is still waiting to READ, and
  * closing the socket because read() returned 0 throws away the answer. */
 static int VS_MUTE[VS_MAX];
 static int VS_INIT;
-static int VS_LISTEN_FD = -1;
+/* Inward listeners. More than one, because a VMM that can carry a docker
+ * socket in can carry a forwarded port in the same way, and the two have to be
+ * told apart by WHICH guest port they arrive at. */
+#define VS_LMAX 8
+static int VS_LFD[VS_LMAX];
+static int VS_LPORT[VS_LMAX];
+static int VS_LN;
+static int VS_LAST_PORT;
 
 static void vs_init(void) {
     if (VS_INIT) return;
+    /* Writing to a socket whose peer has gone raises SIGPIPE, and the default
+     * action is to kill the process. A VMM that dies because a CLIENT hung up
+     * takes the guest and every other connection with it -- and it looks from
+     * outside like the daemon inside the VM crashed, which is where two hours
+     * went: `docker compose up` abandons its /events connection when it
+     * exits, the guest wrote to that stream a moment later, and this process
+     * was killed by the write.
+     *
+     * The daemon in the guest already does this for the same reason. So does
+     * every server that has met a client that hangs up. */
+    signal(SIGPIPE, SIG_IGN);
     for (int i = 0; i < VS_MAX; i++) { VS_FD[i] = -1; VS_MUTE[i] = 0; }
     VS_INIT = 1;
 }
@@ -392,11 +420,30 @@ int hv_vs_connect(const char *path) {
  * The listening socket is the VMM's, on the host's filesystem, so an ordinary
  * host program connects to an ordinary path and does not know a VM is involved.
  */
-int hv_vs_listen(const char *path) {
+/* `path` is a filesystem path, or "tcp:<port>" for a loopback TCP port. Both
+ * are places a host program connects to; which one a mapping uses is the
+ * caller's fact, and a published container port is naturally the second. */
+int hv_vs_listen(const char *path, int gport) {
     vs_init();
-    if (VS_LISTEN_FD >= 0) return -2;
+    if (VS_LN >= VS_LMAX) return -2;
+    int fd;
+    if (!strncmp(path, "tcp:", 4)) {
+        int port = atoi(path + 4);
+        if (port <= 0 || port > 65535) return -4;
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        struct sockaddr_in in;
+        memset(&in, 0, sizeof in);
+        in.sin_family = AF_INET;
+        in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        in.sin_port = htons((uint16_t)port);
+        if (bind(fd, (struct sockaddr *)&in, sizeof in) != 0) { close(fd); return -1; }
+        if (listen(fd, 16) != 0) { close(fd); return -1; }
+    } else {
     unlink(path);
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un a;
     memset(&a, 0, sizeof a);
@@ -404,9 +451,10 @@ int hv_vs_listen(const char *path) {
     snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
     if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
     if (listen(fd, 16) != 0) { close(fd); return -1; }
+    }
     int fl = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    VS_LISTEN_FD = fd;
+    VS_LFD[VS_LN] = fd; VS_LPORT[VS_LN] = gport; VS_LN++;
     return 0;
 }
 
@@ -414,17 +462,26 @@ int hv_vs_listen(const char *path) {
  * the vCPU's thread, where blocking means the guest is not running. */
 int hv_vs_accept(void) {
     vs_init();
-    if (VS_LISTEN_FD < 0) return -1;
+    if (VS_LN == 0) return -1;
     int h = -1;
     for (int i = 0; i < VS_MAX; i++) if (VS_FD[i] < 0) { h = i; break; }
     if (h < 0) return -2;               /* no room: a refusal, not "none waiting" */
-    int fd = accept(VS_LISTEN_FD, NULL, NULL);
-    if (fd < 0) return -1;
-    int fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    VS_FD[h] = fd; VS_MUTE[h] = 0;
-    return h;
+    for (int k = 0; k < VS_LN; k++) {
+        int fd = accept(VS_LFD[k], NULL, NULL);
+        if (fd < 0) continue;
+        int fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        VS_FD[h] = fd; VS_MUTE[h] = 0;
+        VS_LAST_PORT = VS_LPORT[k];
+        return h;
+    }
+    return -1;
 }
+
+/* Which mapping the last accepted connection came in on. Two values cannot
+ * cross the FFI boundary in one call, and the guest port is the half that
+ * decides who in the guest answers. */
+int hv_vs_accepted_port(void) { return VS_LAST_PORT; }
 
 /* Stop reading from this end without closing it. An fd at end of file stays
  * readable forever, so a poll that still watched it would spin, and a close
@@ -498,10 +555,10 @@ static volatile int VS_WATCH_RUN;
 static void *vs_watch_thread(void *arg) {
     (void)arg;
     while (VS_WATCH_RUN) {
-        struct pollfd pf[VS_MAX + 1];
+        struct pollfd pf[VS_MAX + VS_LMAX];
         int n = 0;
-        if (VS_LISTEN_FD >= 0) {
-            pf[n].fd = VS_LISTEN_FD; pf[n].events = POLLIN; pf[n].revents = 0; n++;
+        for (int k = 0; k < VS_LN; k++) {
+            pf[n].fd = VS_LFD[k]; pf[n].events = POLLIN; pf[n].revents = 0; n++;
         }
         for (int i = 0; i < VS_MAX; i++)
             if (VS_FD[i] >= 0 && !VS_MUTE[i]) { pf[n].fd = VS_FD[i]; pf[n].events = POLLIN; pf[n].revents = 0; n++; }

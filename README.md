@@ -16,6 +16,20 @@ $ docker -H unix://.build/docker.sock version --format '{{.Server.Version}}/{{.S
 docker (macOS) -> a unix socket -> mvm -> virtio-vsock -> mengd -> mrun -> the container
 ```
 
+`docker compose up` works, and so do published ports — a host TCP port carried
+in over vsock and delivered inside the container's own network namespace:
+
+```
+$ docker -H unix://.build/docker.sock compose up
+ Network compose_default  Created
+ Container compose-hello-1  Created
+Attaching to hello-1
+hello-1  | hello-from-compose
+
+$ nc 127.0.0.1 18080
+hello-from-the-container
+```
+
 Everything after the client is Mere: this VMM, the vsock device it carries the
 stream over, [mengd](https://github.com/284km/mengd) answering the Docker
 Engine API inside the guest, and [mrun](https://github.com/284km/mrun) as its
@@ -267,12 +281,26 @@ on the kernel command line, where an unrecognised `key=value` reaches init as
 an environment variable. Both numbers come from the same call, so they cannot
 disagree.
 
+## The client that hangs up
+
+`docker compose up` abandons its `/events` connection when it exits. The guest
+wrote to that stream a moment later, and **this process was killed by the
+write**: the default action for `SIGPIPE` is to terminate, and a VMM that dies
+because a client hung up takes the guest and every other connection with it.
+
+From outside it looked exactly like the daemon *inside* the VM crashing — the
+docker client reported `EOF` on a request that had been delivered in full, the
+guest's console stopped, and the same sequence worked perfectly against the
+same daemon over a plain unix socket. Every check that existed was green.
+`test/stack.sh` now abandons a streaming connection on purpose and requires the
+VMM to survive it and say so.
+
 ## What is next
 
-**Ports, and more than one thing at a time.** Every inward connection goes to
-one guest port, there are eight streams, and there is no port mapping, so a
-container that listens is not reachable from the host. `docker compose up` is
-the next real user.
+**Ports that are not agreed in advance.** The host's end of a published port
+has to be open before the VM starts, because opening it is the host's job and
+nothing in the guest can ask for one yet. Making that dynamic means a control
+channel between the daemon and the VMM, which is what a host agent is for.
 
 The language change this project expected never arrived. `Raw`, Mere's window
 type for physical memory, was going to need a second source so that a virtio

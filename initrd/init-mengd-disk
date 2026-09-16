@@ -29,11 +29,30 @@ say "vsock modules loaded"
 # A container runtime needs these to exist inside the container's own view.
 mkdir -p /var/lib/mengd /usr/local/bin /tmp /run
 cp /opt/mrun /usr/local/bin/mrun && chmod 755 /usr/local/bin/mrun
+cp /opt/mfwd /usr/local/bin/mfwd && chmod 755 /usr/local/bin/mfwd
 chmod 1777 /tmp
 
-MENGD_TRACE=1 /opt/mengd vsock://1024 /var/lib/mengd /usr/local/bin/mrun 2>&1 | \
-  while read -r l; do echo "mengd: $l" > /dev/kmsg; done &
+# The daemon's own output goes to a file, and a tail carries it to the console.
+# HOW IT ENDS is reported separately, because that is the one line that never
+# appears in its output: a signal has no last words, and 139 and 134 and 1 are
+# three different faults wearing the same silence.
+mkdir -p /var/log
+: > /var/log/mengd.log
+# Straight to the serial console, not through /dev/kmsg. The kernel rate-limits
+# what userspace writes to kmsg, and what it drops is whatever a busy daemon
+# said last -- which is the only part worth having when it stops.
+CON=/dev/ttyAMA0
+[ -c "$CON" ] || CON=/dev/kmsg
+( MENGD_TRACE=1 /opt/mengd vsock://1024 /var/lib/mengd /usr/local/bin/mrun \
+    >> /var/log/mengd.log 2>&1
+  echo "mengd EXITED with status $?" >> /var/log/mengd.log ) &
+( tail -f /var/log/mengd.log | while read -r l; do echo "mengd: $l" > "$CON"; done ) &
+# The log has to reach the DISK, not just the page cache: this machine is
+# stopped by being killed, and an unflushed file is one the host cannot read
+# back. That is why the first three attempts at reading it found nothing.
+( while true; do sync; sleep 2; done ) &
 say "mengd started on vsock port 1024"
+
 
 i=0
 while [ "$i" -lt "${MENGD_SECONDS:-180}" ]; do sleep 1; i=$((i+1)); done

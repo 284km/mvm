@@ -32,7 +32,8 @@ extern fn hv_write_u16: str -> int -> int;
 extern fn hv_write_u64: str -> str -> int;
 extern fn hv_spi: int -> int -> int;
 extern fn hv_vs_connect: str -> int;
-extern fn hv_vs_listen: str -> int;
+extern fn hv_vs_listen: str -> int -> int;
+extern fn hv_vs_accepted_port: unit -> int;
 extern fn hv_vs_accept: unit -> int;
 extern fn hv_vs_close: int -> int;
 extern fn hv_vs_send: int -> str -> int -> int;
@@ -64,9 +65,9 @@ let vs_qfirst = 5; let vs_qstride = 6;
 let vs_isr_reads = 23;   // how many times the guest has read this device's ISR
 let vs_polls = 24;       // how many times the host end has been asked
 let vs_next_hport = 25;  // this end's port for the next inward stream
-let vs_in_port = 26;     // the guest port inward connections are handed to
-let vs_sfirst = 27; let vs_sstride = 8; let vs_smax = 8;
-let vs_state_n = 27 + 8 * 8;
+let vs_in_port = 26;     // non-zero once anything is listening inward
+let vs_sfirst = 27; let vs_sstride = 8; let vs_smax = 32;
+let vs_state_n = 27 + 32 * 8;
 
 // A stream's fields, and its state: free, waiting for the guest to answer a
 // REQUEST this end sent, or open.
@@ -244,6 +245,9 @@ let vs_pump_one = fn (s) -> fn (i: int) ->
             let _ = vs_put_hdr a (sget s i s_hport) (sget s i s_gport)
                                  n op_rw 0 (sget s i s_fwd) in
             let _ = sset s i s_sent (sget s i s_sent + n) in
+            let _ = if vs_tracing () then
+                      print_err ("mvm: vsock host->guest " ++ show n ++ " bytes on host port "
+                              ++ show (sget s i s_hport)) else () in
             let _ = vs_rx_done s head (vs_hdr + n) in
             n
           else if n == 0 - 2 then
@@ -285,7 +289,9 @@ let vs_accept = fn (s) ->
         let _ = hv_vs_close h in 0
       else
         let hp = (vec_get s vs_next_hport : int) in
-        let gp = (vec_get s vs_in_port : int) in
+        // WHICH mapping it arrived on decides who in the guest answers. One
+        // field holding "the" inward port cannot answer for several.
+        let gp = hv_vs_accepted_port () in
         let _ = vec_set s vs_next_hport (hp + 1) in
         let _ = sset s i s_handle h in
         let _ = sset s i s_gport gp in
@@ -458,11 +464,11 @@ let vs_polls_of = fn (s) -> (vec_get s vs_polls : int);
 let vs_listen = fn (s) -> fn (path: str) -> fn (gport: int) ->
   if str_len path == 0 then 0
   else
-    let r = hv_vs_listen path in
+    let r = hv_vs_listen path gport in
     if r != 0 then
       let _ = print_err ("mvm: vsock could not listen at " ++ path) in 0 - 1
     else
-      let _ = vec_set s vs_in_port gport in
+      let _ = vec_set s vs_in_port 1 in
       let _ = print_err ("mvm: vsock listening at " ++ path
                       ++ " for guest port " ++ show gport) in
       0;

@@ -1,6 +1,8 @@
 .build/
-# Only the sources in guest/ are tracked. The binaries there are built for the
+# Only sources in guest/ are tracked. The binaries there are built for the
 # guest by a container and are the wrong architecture for this machine, so
-# naming each one would mean remembering to name the next one too.
+# naming each one would mean remembering to name the next one too -- and the
+# first version of this rule was wide enough to swallow mfwd.mere as well.
 guest/*
 !guest/*.c
+!guest/*.mere

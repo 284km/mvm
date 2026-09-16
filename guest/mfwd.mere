@@ -1,0 +1,58 @@
+// mfwd.mere — one forwarded port, inside the guest.
+//
+//   mfwd <vsock port> <local port> [<container pid>]
+//
+// WHY THIS EXISTS. A container listening inside the VM is not reachable from
+// the host: there is no network interface, because vmnet.framework will not
+// start one for a process that is not root. vsock is the way in, and vsock is
+// not TCP -- so something on this side has to be the thing the host's
+// connection arrives at, and connect onward to where the container is
+// listening.
+//
+// WHY THERE IS NO PROTOCOL ON THE WIRE. One forwarder per published port, with
+// both numbers given on the command line, rather than a generic one that reads
+// a destination from the head of the stream. A protocol here would be a second
+// thing to get wrong for no gain: the mapping is already decided by whoever
+// started the VM, because that is who opened the host's end of it.
+
+extern fn fw_listen: int -> int;
+extern fn fw_accept: int -> int;
+extern fn fw_connect_in: int -> int -> int;
+extern fn fw_pipe: int -> int -> int;
+extern fn fw_close: int -> int;
+
+let serve = fn (vport: int) -> fn (lport: int) -> fn (pid: int) ->
+  let srv = fw_listen vport in
+  let _ = if srv < 0 then
+            let _ = print_err ("mfwd: cannot listen on vsock port " ++ show vport) in exit 1
+          else () in
+  let _ = print_err ("mfwd: vsock port " ++ show vport ++ " to 127.0.0.1:" ++ show lport
+                  ++ (if pid > 0 then " in the namespace of pid " ++ show pid else "")) in
+  let rec loop = fn (u: unit) ->
+    let c = fw_accept srv in
+    if c < 0 then loop ()
+    else
+      let up = fw_connect_in pid lport in
+      if up < 0 then
+        // Named and closed, not left hanging. A container that is not
+        // listening yet is the normal case just after `docker run`, and a
+        // caller that gets a closed connection can try again; one that gets
+        // silence cannot tell that from a slow answer. The three ways this
+        // fails are different facts and are reported as such.
+        let _ = print_err ("mfwd: "
+                        ++ (if up == 0 - 2 then "pid " ++ show pid ++ " is gone"
+                            else if up == 0 - 3 then "cannot enter the namespace of pid " ++ show pid
+                            else "nothing listening on 127.0.0.1:" ++ show lport)) in
+        let _ = fw_close c in
+        loop ()
+      else
+        // A thread per connection. fw_pipe blocks until both directions have
+        // ended, so a serial loop would serve one caller ever.
+        let _ = spawn (fn (unit_: unit) -> let _ = fw_pipe c up in ()) in
+        loop () in
+  loop ();
+
+match args () with
+| [vport, lport] -> serve (int_of_str vport) (int_of_str lport) 0
+| [vport, lport, pid] -> serve (int_of_str vport) (int_of_str lport) (int_of_str pid)
+| _ -> let _ = print_err "usage: mfwd <vsock port> <local port> [container pid]" in exit 2

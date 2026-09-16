@@ -101,6 +101,15 @@ let handle_request = fn (s) -> fn (disk: str) -> fn (head: int) ->
     let d2 = if bit_and (desc_flags s d1) vring_desc_f_next != 0 then desc_next s d1 else 0 - 1 in
     if d2 < 0 then 0
     else
+      // The chain this device knows is header, ONE data descriptor, status.
+      // A scatter-gather write has several data descriptors, and walking to
+      // "the next one" then calling it the status byte writes a status into
+      // the guest's DATA and loses the rest -- silently, and only once the
+      // filesystem is fragmented enough to produce such a chain.
+      let _ = if bit_and (desc_flags s d2) vring_desc_f_next != 0 then
+                (let _ = print_err ("mvm: virtio-blk refused a chain longer than three descriptors"
+                                 ++ " (head " ++ show head ++ ")") in ())
+              else () in
       let status_a = desc_addr s d2 in
       let wrote =
         if typ == blk_t_in then

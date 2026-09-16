@@ -18,7 +18,15 @@ extern fn hv_gic_redist_size: unit -> int;
 extern fn hv_now_secs: unit -> int;
 
 let ram_base    = 0x40000000;
-let ram_size_mb = 1024;
+// The SAME number boot.mere maps, from the same place, because two files that
+// have to agree are two files that can disagree -- which is what happened:
+// this said 1024 while the VMM mapped 4096, and the guest believed this one.
+// The guest's own "Memory: ... available" line is what the gate compares
+// against, since only the guest can say which of the two it was told.
+let ram_size_mb = fn (u: unit) ->
+  match env_var "MVM_RAM_MB" with
+  | Some v -> (let n = int_of_str v in if n > 0 then n else 4096)
+  | _ -> 4096;
 let uart_base   = 0x9000000;
 let gic_dist    = 0x8000000;
 let gic_redist  = 0x80a0000;
@@ -62,7 +70,13 @@ let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) -
     // reg is <hi lo hi lo> because #address-cells and #size-cells are 2.
     let _ = bn "memory@40000000" in
       let _ = ps "device_type" "memory" in
-      let _ = pc "reg" [0, ram_base, 0, ram_size_mb * 1048576] in
+      // Two cells, high then low. 4 GiB is 0x1_0000_0000, which does not fit
+      // in the low one: written as a single 32-bit value it truncates to ZERO
+      // and the guest is told it has no memory at all. The kernel's answer to
+      // that is "Failed to allocate page table page" in paging_init, which
+      // names neither the tree nor the size.
+      let ram_sz = ram_size_mb () * 1048576 in
+      let _ = pc "reg" [0, ram_base, ram_sz / 4294967296, bit_and ram_sz 0xffffffff] in
     let _ = en () in
 
     let _ = bn "cpus" in

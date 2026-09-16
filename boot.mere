@@ -10,7 +10,7 @@ import "vsock.mere";
 // and timer, and nothing about that can be faked by a VMM that merely started.
 
 extern fn hv_up: unit -> int;
-extern fn hv_map: str -> int -> int;
+extern fn hv_map: str -> str -> int;
 extern fn hv_gic_up: str -> str -> int;
 extern fn hv_load_file: str -> str -> int;
 extern fn hv_vcpu_new: unit -> int;
@@ -36,7 +36,6 @@ extern fn hv_gic_redist_base_of_vcpu: unit -> str;
 
 let ram_base_hex = "0x40000000";
 let ram_base = 0x40000000;
-let ram_bytes = 1073741824;                 // 1 GiB, and the kernel wants 60 MiB of it
 let dtb_gpa = 0x48000000;                   // above the kernel image, 2 MiB aligned
 let dtb_gpa_hex = "0x48000000";
 let initrd_gpa_hex = "0x4a000000";
@@ -79,6 +78,12 @@ let int_or = fn (v: str) -> fn (d: int) ->
            if c < 48 then d else if c > 57 then d else go (i + 1) (acc * 10 + (c - 48)) in
     go 0 0;
 
+// How much memory the guest gets. A kernel needs 60 MiB of it; a container
+// host needs rather more -- the daemon that runs in here holds about 200 MiB
+// for every container it builds, for a reason written down in mengd's own
+// rootfs.mere. MVM_RAM_MB overrides it.
+let ram_bytes = int_or (env_or "MVM_RAM_MB") 4096 * 1024 * 1024;
+
 let must = fn (what: str) -> fn (rc: int) ->
   if rc != 0 then
     let _ = print_err ("mvm: " ++ what ++ " -> 0x" ++ hex rc) in exit 1
@@ -113,7 +118,8 @@ let iss_reg = fn (iss: int) -> bit_and (bit_shr iss 16) 31;
 
 let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str) ->
   let _ = must "hv_vm_create" (hv_up ()) in
-  let _ = must "hv_vm_map" (hv_map ram_base_hex ram_bytes) in
+  let _ = must "hv_vm_map" (hv_map ram_base_hex (hexs ram_bytes)) in
+  let _ = print_err ("mvm: " ++ show (ram_bytes / 1048576) ++ " MiB of guest memory") in
   // The GIC has to exist before the vCPU, and at the addresses the device tree
   // told the kernel to look.
   let _ = must "hv_gic_create" (hv_gic_up gic_dist_hex gic_redist_hex) in
@@ -156,7 +162,23 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
   // which is a different answer from the device not being there at all.
   let vs = vs_new () in
   let vspath = env_or "MVM_VSOCK" in
-  let _ = vs_listen vs (env_or "MVM_VSOCK_IN") (int_or (env_or "MVM_VSOCK_PORT") 1024) in
+  // MVM_VSOCK_IN is a list: "<path>=<guest port>,<path>=<guest port>". A bare
+  // path takes MVM_VSOCK_PORT, which is what one socket used to mean. Several
+  // exist because a docker socket and a forwarded port arrive the same way and
+  // are told apart by which guest port they reach.
+  let dflt_port = int_or (env_or "MVM_VSOCK_PORT") 1024 in
+  let rec listen_all = fn (spec: str) ->
+    if str_len spec == 0 then 0
+    else
+      let comma = str_index_of spec "," in
+      let one = if comma < 0 then spec else substring spec 0 comma in
+      let rest = if comma < 0 then "" else substring spec (comma + 1) (str_len spec) in
+      let eq = str_index_of one "=" in
+      let path = if eq < 0 then one else substring one 0 eq in
+      let port = if eq < 0 then dflt_port else int_or (substring one (eq + 1) (str_len one)) dflt_port in
+      let _ = vs_listen vs path port in
+      listen_all rest in
+  let _ = listen_all (env_or "MVM_VSOCK_IN") in
   let _ = if str_len vspath > 0 then print_err ("mvm: vsock host end " ++ vspath) else () in
   let disk_sectors = if str_len disk == 0 then 0 else file_size disk / 512 in
   let _ = if str_len disk > 0 then
