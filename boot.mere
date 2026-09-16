@@ -1,3 +1,5 @@
+import "virtio.mere";
+
 // boot.mere — start a Linux kernel and listen to what it says.
 //
 //   mvm-boot <Image> <dtb>
@@ -26,6 +28,9 @@ extern fn hv_exit_pa: unit -> str;
 extern fn hv_advance_pc: unit -> int;
 extern fn hv_mask_vtimer: unit -> int;
 extern fn hv_set_sys: str -> str -> int;
+extern fn now_ms: unit -> int;
+extern fn hv_start_deadline: int -> int;
+extern fn hv_deadline_fired: unit -> int;
 extern fn hv_gic_redist_base_of_vcpu: unit -> str;
 
 let ram_base_hex = "0x40000000";
@@ -46,6 +51,18 @@ let hex = fn (v: int) ->
   let rec go = fn (n: int) -> fn (acc: str) ->
     if n == 0 then acc else go (n / 16) (char_at digits (n % 16) ++ acc) in
   if v == 0 then "0" else go v "";
+
+let env_or = fn (k: str) -> match env_var k with | Some v -> v | None -> "";
+let int_or = fn (v: str) -> fn (d: int) ->
+  let t = str_trim v in
+  let n = str_len t in
+  if n == 0 then d
+  else
+    let rec go = fn (i: int) -> fn (acc: int) ->
+      if i == n then acc
+      else let c = ord (char_at t i) in
+           if c < 48 then d else if c > 57 then d else go (i + 1) (acc * 10 + (c - 48)) in
+    go 0 0;
 
 let must = fn (what: str) -> fn (rc: int) ->
   if rc != 0 then
@@ -79,7 +96,7 @@ let ec_sysreg = 0x18;
 let iss_is_write = fn (iss: int) -> bit_and (bit_shr iss 6) 1 == 1;
 let iss_reg = fn (iss: int) -> bit_and (bit_shr iss 16) 31;
 
-let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) ->
+let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str) ->
   let _ = must "hv_vm_create" (hv_up ()) in
   let _ = must "hv_vm_map" (hv_map ram_base_hex ram_bytes) in
   // The GIC has to exist before the vCPU, and at the addresses the device tree
@@ -117,14 +134,29 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) ->
   let _ = must "x2" (hv_set_x 2 "0x0") in
   let _ = must "x3" (hv_set_x 3 "0x0") in
   let _ = must "set pc" (hv_set_pc ram_base_hex) in
+  let vio = vio_new () in
+  let disk_sectors = if str_len disk == 0 then 0 else file_size disk / 512 in
+  let _ = if str_len disk > 0 then
+            print_err ("mvm: disk " ++ disk ++ " (" ++ show disk_sectors ++ " sectors)")
+          else () in
   let _ = print_err "mvm: running" in
 
   // The loop. Every exit is either a device this VMM answers for, a PSCI call,
   // or something it does not know -- and the last one is reported rather than
   // ignored, because a silently swallowed exit is a guest that stops making
   // sense somewhere else.
+  // A wall-clock deadline as well as an exit count. A guest that is waiting for
+  // something the VMM never does -- a used-ring entry that never appears, an
+  // interrupt never raised -- does not spin: it sits in WFI, and an exit count
+  // takes a very long time to reach. A VMM that never gives up cannot be
+  // tested, because the test hangs with it.
+  // The deadline runs on its own thread and forces the vCPU out of the
+  // framework's run(), because a guest in WFI never comes back on its own.
+  let _ = hv_start_deadline (int_or (env_or "MVM_TIMEOUT_MS") 20000) in
   let rec run = fn (n: int) -> fn (out: int) ->
-    if n > 4000000 then
+    if hv_deadline_fired () == 1 then
+      let _ = print_err ("mvm: gave up at the deadline after " ++ show n ++ " exits") in out
+    else if n > 4000000 then
       let _ = print_err ("mvm: stopping after " ++ show n ++ " exits") in out
     else
       let rc = hv_run () in
@@ -155,7 +187,21 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) ->
             // address the device tree named, and only the physical one says so.
             let va = hex_val (hv_exit_pa ()) in
             let iss = hv_exit_iss () in
-            if va >= uart_base then
+            if va >= vio_base then
+              (if va < vio_base + 0x200 then
+                 let off = va - vio_base in
+                 let _ = if iss_is_write iss then
+                           (let v = bit_and (hex_val (hv_get_x (iss_reg iss))) 0xffffffff in
+                            let _ = vio_write vio off v disk in ())
+                         else
+                           let r = vio_read vio off disk_sectors in
+                           let _ = hv_set_x (iss_reg iss) (hexs r) in () in
+                 let _ = hv_advance_pc () in
+                 run (n + 1) out
+               else
+                 let _ = print_err ("mvm: unhandled data abort at " ++ hv_exit_pa ()
+                                 ++ " (va " ++ hv_exit_va () ++ ")") in out)
+            else if va >= uart_base then
               (if va < uart_base + 4096 then
                  // The PL011's data register is at offset 0; a write there is
                  // a character. Everything else in the block reads as zero,
@@ -200,6 +246,7 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) ->
   ();
 
 match args () with
-| [image, dtb] -> boot image dtb ""
-| [image, dtb, initrd] -> boot image dtb initrd
-| _ -> let _ = print_err "usage: mvm-boot <Image> <dtb> [initrd]" in exit 2
+| [image, dtb] -> boot image dtb "" ""
+| [image, dtb, initrd] -> boot image dtb initrd ""
+| [image, dtb, initrd, disk] -> boot image dtb initrd disk
+| _ -> let _ = print_err "usage: mvm-boot <Image> <dtb> [initrd] [disk]" in exit 2

@@ -15,8 +15,17 @@ through PSCI.
 mvm: guest called PSCI SYSTEM_OFF
 ```
 
-Without an initramfs it boots the same way and panics because there is no root
-filesystem, which is the one thing this VMM does not provide yet.
+It has a **virtio-blk device**, so the guest mounts a real filesystem off a
+disk image and reads and writes files on it:
+
+```
+[    0.103121] virtio_blk virtio0: [vda] 32768 512-byte logical blocks (16.8 MB)
+[    0.159524] EXT4-fs (vda): mounted filesystem ... r/w with ordered data mode
+userspace: disk says: this file came off a virtio-blk device emulated in Mere
+userspace: wrote a file back
+```
+
+and the host finds those bytes in the image afterwards.
 
 ```
 [    0.000000] Booting Linux on physical CPU 0x0000000000 [0x610f0000]
@@ -31,6 +40,7 @@ mvm: guest called PSCI SYSTEM_RESET
 
 ```sh
 sh initrd/build.sh   # an initramfs from a container image, with the init below
+sh test/disk.sh      # virtio-blk, judged from both ends
 sh test/init.sh      # userspace runs
 sh test/boot.sh      # the kernel boots and panics for the right reason
 sh test/run.sh       # the one-instruction check
@@ -149,10 +159,38 @@ general one.
 The actual cause was one step earlier than any of them: `2>/dev/null` on the
 first line, opening a file that does not exist yet.
 
+### A VMM that never gives up cannot be tested
+
+`hv_vcpu_run` blocks. A guest waiting for an interrupt a broken device never
+raises sits in WFI, the framework does not return, and a deadline checked
+between exits is never reached — **the loop doing the checking is not running**.
+Checking the clock in that thread is checking it in the one place that is not
+executing.
+
+The first attempt did exactly that, and the poison for "never advance the used
+ring" hung the test instead of failing it. `hv_vcpus_exit` from a second thread
+is what forces the vCPU out, and with it the same poison fails in five seconds
+with four named checks red.
+
+### What the poisons say
+
+| break | what goes red |
+|---|---|
+| never advance the used ring index | the guest never sees a request complete: no `/dev/vda`, no mount, no file |
+| never raise the interrupt | the same, for the same reason one step later |
+
+Both take the deadline rather than reporting anything, which is why the
+deadline had to work before the poisons meant anything.
+
 ## What it does not do
 
-No block device: userspace here is an initramfs, which the kernel unpacks
-into memory. A root filesystem on a disk needs virtio-blk, which is next. No network, no console
+One virtio device and one queue. Indirect descriptors are not offered, so a
+driver cannot ask for them; `VIRTIO_BLK_T_FLUSH` is answered as unsupported,
+which is honest for a device with no write cache of its own. A request whose
+descriptor chain is not the shape the specification requires is answered
+`VIRTIO_BLK_S_UNSUPP` rather than guessed at. See `DESIGN-virtio.md`.
+
+No network, no console input, no SMP. No network, no console
 input, no SMP: PSCI answers `NOT_SUPPORTED` to everything except the two calls
 that end the machine. System registers this VMM does not emulate read as zero
 and drop writes, which is what every VMM does with the debug and trace

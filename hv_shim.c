@@ -16,6 +16,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <time.h>
 #include <fcntl.h>
 
 static hv_vcpu_t VCPU;
@@ -275,3 +276,47 @@ long long hv_guest_to_file(const char *gpa_hex, int len, const char *path, long 
     ssize_t n = pwrite(fd, p, (size_t)len, (off_t)off);
     return n < 0 ? -1 : (long long)n;
 }
+
+/* ---- injecting an interrupt -------------------------------------------- */
+/*
+ * Level, not edge. The specification allows either and an edge is one pulse:
+ * if the driver is not looking when it arrives, it is gone. A level stays up
+ * until the driver acknowledges, so a driver that was busy still finds it.
+ */
+int hv_spi(int intid, int level) { return (int)hv_gic_set_spi((uint32_t)intid, level != 0); }
+
+/* ---- a deadline the vCPU cannot ignore ---------------------------------- */
+/*
+ * hv_vcpu_run BLOCKS. A guest waiting for an interrupt that a broken device
+ * never raises sits in WFI, the framework does not return, and a deadline
+ * checked between exits is never reached -- the loop is not running. Checking
+ * the clock in the same thread is checking it in the one place that is not
+ * executing.
+ *
+ * hv_vcpus_exit forces the vCPU out of run() from ANOTHER thread, which is
+ * what this is for. Without it a device bug hangs the VMM, and a test for that
+ * bug hangs with it.
+ */
+#include <pthread.h>
+static int DEADLINE_MS = 0;
+static volatile int DEADLINE_FIRED = 0;
+
+static void *deadline_thread(void *arg) {
+    (void)arg;
+    struct timespec ts = { DEADLINE_MS / 1000, (long)(DEADLINE_MS % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+    DEADLINE_FIRED = 1;
+    hv_vcpu_t v = VCPU;
+    hv_vcpus_exit(&v, 1);
+    return NULL;
+}
+
+int hv_start_deadline(int ms) {
+    if (ms <= 0) return 0;
+    DEADLINE_MS = ms;
+    pthread_t t;
+    if (pthread_create(&t, NULL, deadline_thread, NULL) != 0) return -1;
+    pthread_detach(t);
+    return 0;
+}
+int hv_deadline_fired(void) { return DEADLINE_FIRED; }

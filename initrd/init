@@ -12,5 +12,23 @@ echo "userspace: uname $(uname -srm)" > /dev/kmsg
 echo "userspace: pid $$ uid $(id -u)" > /dev/kmsg
 echo "userspace: root has $(ls / | wc -l) entries" > /dev/kmsg
 echo "userspace: init is done" > /dev/kmsg
+# The disk. Its contents were put there by the host, so reading them back is
+# proof the queue was walked, the data landed where the descriptors said, and
+# the interrupt arrived -- none of which "the registers read back" would show.
+if [ -b /dev/vda ]; then
+  echo "userspace: /dev/vda exists" > /dev/kmsg
+  mkdir -p /mnt
+  if mount -t ext4 /dev/vda /mnt 2>/dev/null; then
+    echo "userspace: mounted /dev/vda" > /dev/kmsg
+    echo "userspace: disk says: $(cat /mnt/hello.txt 2>/dev/null)" > /dev/kmsg
+    echo "written by the guest" > /mnt/fromguest.txt 2>/dev/null && \
+      echo "userspace: wrote a file back" > /dev/kmsg
+    umount /mnt 2>/dev/null
+  else
+    echo "userspace: could not mount /dev/vda" > /dev/kmsg
+  fi
+else
+  echo "userspace: no /dev/vda" > /dev/kmsg
+fi
 poweroff -f
 exit 99

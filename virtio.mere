@@ -1,0 +1,174 @@
+// virtio.mere — a virtio-mmio transport and one block device.
+//
+// The guest drives this through 32-bit registers at a fixed address; the queue
+// is in the guest's own RAM and is read by copying. See DESIGN-virtio.md for
+// what is implemented and what is refused.
+
+extern fn hv_read_u32: str -> int;
+extern fn hv_read_u16: str -> int;
+extern fn hv_write_u32: str -> int -> int;
+extern fn hv_write_u16: str -> int -> int;
+extern fn hv_read_u64: str -> str;
+extern fn hv_file_to_guest: str -> int -> str -> int -> int;
+extern fn hv_guest_to_file: str -> int -> str -> int -> int;
+extern fn hv_spi: int -> int -> int;
+
+let vio_base = 0xa000000;
+let vio_intid = 48;                 // SPI 16 in the device tree, which is 32+16
+let vio_qmax = 64;
+let sector = 512;
+
+// Device state. A Vec because the exit loop mutates it across calls, and the
+// alternative -- threading a record through every branch -- would be the same
+// state with more places to forget to pass it.
+let st_dfsel = 0; let st_drvfsel = 1; let st_qsel = 2; let st_qnum = 3;
+let st_qready = 4; let st_desc = 5; let st_avail = 6; let st_used = 7;
+let st_status = 8; let st_isr = 9; let st_lastavail = 10; let st_dhi = 11;
+let st_ahi = 12; let st_uhi = 13; let st_n = 14;
+
+let vio_new = fn (u: unit) ->
+  let v = vec_new () in
+  let rec fill = fn (i: int) ->
+    if i == st_n then () else let _ = vec_push v 0 in fill (i + 1) in
+  let _ = fill 0 in
+  v;
+
+let hexs = fn (v: int) ->
+  let digits = "0123456789abcdef" in
+  let rec go = fn (n: int) -> fn (acc: str) ->
+    if n == 0 then acc else go (n / 16) (char_at digits (n % 16) ++ acc) in
+  "0x" ++ (if v == 0 then "0" else go v "");
+
+let hexv = fn (h: str) ->
+  let n = str_len h in
+  let start = if n > 2 then (if substring h 0 2 == "0x" then 2 else 0) else 0 in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i == n then acc
+    else
+      let c = ord (char_at h i) in
+      if c >= 48 then
+        (if c <= 57 then go (i + 1) (acc * 16 + (c - 48))
+         else if c >= 97 then (if c <= 102 then go (i + 1) (acc * 16 + (c - 87)) else acc)
+         else if c >= 65 then (if c <= 70 then go (i + 1) (acc * 16 + (c - 55)) else acc)
+         else acc)
+      else acc in
+  go start 0;
+
+let g32 = fn (a: int) -> hv_read_u32 (hexs a);
+let g16 = fn (a: int) -> hv_read_u16 (hexs a);
+let s32 = fn (a: int) -> fn (v: int) -> hv_write_u32 (hexs a) v;
+let s16 = fn (a: int) -> fn (v: int) -> hv_write_u16 (hexs a) v;
+let g64 = fn (a: int) -> hexv (hv_read_u64 (hexs a));
+
+// ---- the queue -----------------------------------------------------------
+//
+// Split virtqueue: a table of 16-byte descriptors, an available ring the
+// driver writes, and a used ring the device writes.
+
+let desc_addr = fn (s) -> fn (i: int) -> g64 ((vec_get s st_desc : int) + i * 16);
+let desc_len  = fn (s) -> fn (i: int) -> g32 ((vec_get s st_desc : int) + i * 16 + 8);
+let desc_flags= fn (s) -> fn (i: int) -> g16 ((vec_get s st_desc : int) + i * 16 + 12);
+let desc_next = fn (s) -> fn (i: int) -> g16 ((vec_get s st_desc : int) + i * 16 + 14);
+
+let vring_desc_f_next = 1;
+let vring_desc_f_write = 2;
+
+let blk_t_in = 0;
+let blk_t_out = 1;
+let blk_s_ok = 0;
+let blk_s_unsupp = 2;
+
+// One request. The chain is a readable header, some data, and a writable
+// status byte; anything else is answered UNSUPP rather than guessed at.
+let handle_request = fn (s) -> fn (disk: str) -> fn (head: int) ->
+  let hdr = desc_addr s head in
+  let typ = g32 hdr in
+  let sec = g64 (hdr + 8) in
+  // Walk to the data descriptor and then the status one.
+  let d1 = if bit_and (desc_flags s head) vring_desc_f_next != 0 then desc_next s head else 0 - 1 in
+  if d1 < 0 then 0
+  else
+    let data_a = desc_addr s d1 in
+    let data_l = desc_len s d1 in
+    let d2 = if bit_and (desc_flags s d1) vring_desc_f_next != 0 then desc_next s d1 else 0 - 1 in
+    if d2 < 0 then 0
+    else
+      let status_a = desc_addr s d2 in
+      let wrote =
+        if typ == blk_t_in then
+          let n = hv_file_to_guest disk (sec * sector) (hexs data_a) data_l in
+          if n < 0 then 0 - 1 else data_l
+        else if typ == blk_t_out then
+          let n = hv_guest_to_file (hexs data_a) data_l disk (sec * sector) in
+          if n < 0 then 0 - 1 else 0
+        else 0 - 1 in
+      let _ = s32 status_a (if wrote < 0 then blk_s_unsupp else blk_s_ok) in
+      if wrote < 0 then 1 else wrote + 1;
+
+// Everything the driver has made available since last time.
+let vio_notify = fn (s) -> fn (disk: str) ->
+  let avail = (vec_get s st_avail : int) in
+  let used = (vec_get s st_used : int) in
+  let qnum = (vec_get s st_qnum : int) in
+  if qnum == 0 then 0
+  else
+    let aidx = g16 (avail + 2) in
+    let rec go = fn (last: int) -> fn (n: int) ->
+      if last == aidx then n
+      else
+        let head = g16 (avail + 4 + (last % qnum) * 2) in
+        let len = handle_request s disk head in
+        let uidx = g16 (used + 2) in
+        let _ = s32 (used + 4 + (uidx % qnum) * 8) head in
+        let _ = s32 (used + 4 + (uidx % qnum) * 8 + 4) len in
+        let _ = s16 (used + 2) (bit_and (uidx + 1) 65535) in
+        go (bit_and (last + 1) 65535) (n + 1) in
+    let done = go (vec_get s st_lastavail : int) 0 in
+    let _ = vec_set s st_lastavail aidx in
+    if done > 0 then
+      let _ = vec_set s st_isr 1 in
+      let _ = hv_spi vio_intid 1 in
+      done
+    else done;
+
+// ---- the transport registers --------------------------------------------
+
+let vio_read = fn (s) -> fn (off: int) -> fn (capacity_sectors: int) ->
+  if off == 0x000 then 0x74726976                 // "virt"
+  else if off == 0x004 then 2                     // version 2
+  else if off == 0x008 then 2                     // block device
+  else if off == 0x00c then 0x4d455245             // "MERE"
+  else if off == 0x010 then
+    // Only VIRTIO_F_VERSION_1, which is bit 32 -- so it appears when the
+    // driver selects the high word. Offering nothing else is what keeps
+    // indirect descriptors out of the queue this VMM has to walk.
+    (if (vec_get s st_dfsel : int) == 1 then 1 else 0)
+  else if off == 0x034 then vio_qmax
+  else if off == 0x044 then (vec_get s st_qready : int)
+  else if off == 0x060 then (vec_get s st_isr : int)
+  else if off == 0x070 then (vec_get s st_status : int)
+  else if off == 0x0fc then 0
+  else if off == 0x100 then bit_and capacity_sectors 0xffffffff
+  else if off == 0x104 then 0
+  else 0;
+
+let vio_write = fn (s) -> fn (off: int) -> fn (v: int) -> fn (disk: str) ->
+  if off == 0x014 then let _ = vec_set s st_dfsel v in 0
+  else if off == 0x024 then let _ = vec_set s st_drvfsel v in 0
+  else if off == 0x030 then let _ = vec_set s st_qsel v in 0
+  else if off == 0x038 then let _ = vec_set s st_qnum v in 0
+  else if off == 0x044 then let _ = vec_set s st_qready v in 0
+  else if off == 0x050 then vio_notify s disk
+  else if off == 0x064 then
+    // The driver has taken the interrupt; drop the level.
+    let _ = vec_set s st_isr (bit_and (vec_get s st_isr : int) (bit_not v)) in
+    let _ = if (vec_get s st_isr : int) == 0 then hv_spi vio_intid 0 else 0 in
+    0
+  else if off == 0x070 then let _ = vec_set s st_status v in 0
+  else if off == 0x080 then let _ = vec_set s st_desc (bit_or (bit_and (vec_get s st_desc : int) (bit_shl 0xffffffff 32)) v) in 0
+  else if off == 0x084 then let _ = vec_set s st_desc (bit_or (bit_and (vec_get s st_desc : int) 0xffffffff) (bit_shl v 32)) in 0
+  else if off == 0x090 then let _ = vec_set s st_avail (bit_or (bit_and (vec_get s st_avail : int) (bit_shl 0xffffffff 32)) v) in 0
+  else if off == 0x094 then let _ = vec_set s st_avail (bit_or (bit_and (vec_get s st_avail : int) 0xffffffff) (bit_shl v 32)) in 0
+  else if off == 0x0a0 then let _ = vec_set s st_used (bit_or (bit_and (vec_get s st_used : int) (bit_shl 0xffffffff 32)) v) in 0
+  else if off == 0x0a4 then let _ = vec_set s st_used (bit_or (bit_and (vec_get s st_used : int) 0xffffffff) (bit_shl v 32)) in 0
+  else 0;
