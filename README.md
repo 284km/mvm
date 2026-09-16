@@ -301,6 +301,30 @@ same daemon over a plain unix socket. Every check that existed was green.
 `test/stack.sh` now abandons a streaming connection on purpose and requires the
 VMM to survive it and say so.
 
+## Out, as well as in
+
+The guest has no network interface at all — `vmnet_start_interface` returns
+1001 for a process that is not root — so anything it needs from outside goes
+over vsock too. `MVM_VSOCK_OUT` is the table for that direction:
+
+```
+MVM_VSOCK_OUT=5000=tcp:5000       a guest vsock connection to 5000 reaches
+                                  127.0.0.1:5000 on this machine
+```
+
+and `mfwd out 5000 5000` in the guest listens on its own port 5000 and carries
+what arrives there outward. So a daemon inside that knows nothing about any of
+this connects to `127.0.0.1:5000` and reaches a registry running here:
+
+```
+$ docker -H unix://.build/docker.sock pull 127.0.0.1:5000/gate/alpine:v1
+$ docker -H unix://.build/docker.sock run 127.0.0.1:5000/gate/alpine:v1 echo ok
+ok
+```
+
+An address, not a name: there is no resolver in there, and the daemon says
+which of the two things went wrong rather than "cannot fetch the manifest".
+
 ## Three programs and one number
 
 A published port needs all three, and each knows something the others cannot:
@@ -331,6 +355,11 @@ it opens and closes host ports, and who wanted one is the caller's business.
 **More than one machine's worth.** One guest, one docker socket, one set of
 ports. Two VMs would need the control socket to say which — and that is the
 first thing here that would benefit from a name rather than a number.
+
+**A registry it can reach on its own.** Pulling works against a registry on
+this machine. Docker Hub needs token authentication and TLS, which the daemon
+refuses by name today, and that is what stands between this and never needing
+another container runtime to fetch an image.
 
 The language change this project expected never arrived. `Raw`, Mere's window
 type for physical memory, was going to need a second source so that a virtio

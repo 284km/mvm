@@ -1,6 +1,7 @@
 // mfwd.mere — one forwarded port, inside the guest.
 //
-//   mfwd <vsock port> <local port> [<container pid>]
+//   mfwd <vsock port> <local port> [<container pid>]   host -> a container
+//   mfwd out <vsock port> <local port>                  this guest -> the host
 //
 // WHY THIS EXISTS. A container listening inside the VM is not reachable from
 // the host: there is no network interface, because vmnet.framework will not
@@ -18,6 +19,8 @@
 extern fn fw_listen: int -> int;
 extern fn fw_accept: int -> int;
 extern fn fw_connect_in: int -> int -> int;
+extern fn fw_listen_local: int -> int;
+extern fn fw_connect_vsock: int -> int;
 extern fn fw_pipe: int -> int -> int;
 extern fn fw_close: int -> int;
 
@@ -52,7 +55,31 @@ let serve = fn (vport: int) -> fn (lport: int) -> fn (pid: int) ->
         loop () in
   loop ();
 
+// Outward. Something in this guest has no network and wants the host: it
+// connects to a port on the loopback here, and this carries it out on vsock.
+// The VMM decides where that vsock port leads; this only says which one.
+let serve_out = fn (vport: int) -> fn (lport: int) ->
+  let srv = fw_listen_local lport in
+  let _ = if srv < 0 then
+            let _ = print_err ("mfwd: cannot listen on 0.0.0.0:" ++ show lport) in exit 1
+          else () in
+  let _ = print_err ("mfwd: 0.0.0.0:" ++ show lport ++ " out to vsock port " ++ show vport) in
+  let rec loop = fn (u: unit) ->
+    let c = fw_accept srv in
+    if c < 0 then loop ()
+    else
+      let up = fw_connect_vsock vport in
+      if up < 0 then
+        let _ = print_err ("mfwd: the host has no route for vsock port " ++ show vport) in
+        let _ = fw_close c in
+        loop ()
+      else
+        let _ = spawn (fn (unit_: unit) -> let _ = fw_pipe c up in ()) in
+        loop () in
+  loop ();
+
 match args () with
+| ["out", vport, lport] -> serve_out (int_of_str vport) (int_of_str lport)
 | [vport, lport] -> serve (int_of_str vport) (int_of_str lport) 0
 | [vport, lport, pid] -> serve (int_of_str vport) (int_of_str lport) (int_of_str pid)
-| _ -> let _ = print_err "usage: mfwd <vsock port> <local port> [container pid]" in exit 2
+| _ -> let _ = print_err "usage: mfwd <vsock port> <local port> [container pid] | mfwd out <vsock port> <local port>" in exit 2

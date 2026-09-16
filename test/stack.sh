@@ -21,6 +21,8 @@ M="$MERE/_build/default/bin/mere.exe"
 [ -x "$M" ] || { echo "no mere binary at $M" >&2; exit 2; }
 [ -n "$MENGD_SRC" ] && [ -f "$MENGD_SRC/mengd.mere" ] || { echo "set MENGD_SRC=<path to a 284km/mengd checkout>" >&2; exit 2; }
 [ -n "$MRUN_SRC" ] && [ -f "$MRUN_SRC/mrun.mere" ] || { echo "set MRUN_SRC=<path to a 284km/mrun checkout>" >&2; exit 2; }
+MREG_SRC="${MREG_SRC:-}"
+[ -n "$MREG_SRC" ] && [ -f "$MREG_SRC/mreg.mere" ] || { echo "set MREG_SRC=<path to a 284km/mreg checkout>" >&2; exit 2; }
 case "$(uname -sm)" in "Darwin arm64") ;; *) echo "needs macOS on Apple silicon" >&2; exit 2;; esac
 command -v docker >/dev/null 2>&1 || { echo "needs a container runtime" >&2; exit 2; }
 out="$here/.build"; mkdir -p "$out"
@@ -58,6 +60,8 @@ docker run --rm -v "$out:/o" -v "$here/guest:/g:ro" -w /o "$IMG" \
 cp "$out/mfwd-linux" "$out/extra-mengd/mfwd"
 "$M" -c "$here/mports.mere" > "$out/mports.c" 2>"$out/e6" || { echo FAIL mports emit; sed -n 1,8p "$out/e6"; exit 1; }
 cc -O2 -o "$out/mports" "$out/mports.c" "$here/mports_shim.c" 2>/dev/null || { echo FAIL cc mports; exit 1; }
+"$M" -c "$MREG_SRC/mreg.mere" > "$out/mreg.c" 2>"$out/e7" || { echo FAIL mreg emit; sed -n 1,8p "$out/e7"; exit 1; }
+cc -O2 -o "$out/mreg" "$out/mreg.c" "$MREG_SRC/reg_shim.c" 2>/dev/null || { echo FAIL cc mreg; exit 1; }
 chmod 755 "$out/extra-mengd/mengd" "$out/extra-mengd/mrun" "$out/extra-mengd/mfwd"
 
 echo "== build the VMM and a root filesystem =="
@@ -72,13 +76,14 @@ DOCKER_HOST= docker pull -q alpine:latest >/dev/null 2>&1
 DOCKER_HOST= docker save alpine:latest -o "$out/alpine.tar" 2>/dev/null
 [ -r "$out/alpine.tar" ]; say $? "an image for the guest to load"
 
-ROOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/init MENGD_SECONDS=$SECS"
+ROOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/init MENGD_SECONDS=$SECS MVM_FWD_OUT=5000:5000"
 # Stopping one has to stop the PROCESS, not the shell that started it. `( cmd )
 # &` gives back the subshell's pid, and killing that can leave the VM running --
 # which is not a tidy-up problem: the next section binds the same host port,
 # fails, and the OLD guest answers it. A poison then passes because the machine
 # it was meant to break is not the machine being asked.
 stop_vm() {
+  if [ -n "${MREGPID:-}" ]; then kill "$MREGPID" 2>/dev/null; wait "$MREGPID" 2>/dev/null; MREGPID=""; fi
   if [ -n "${MPPID:-}" ]; then kill "$MPPID" 2>/dev/null; wait "$MPPID" 2>/dev/null; MPPID=""; fi
   if [ -n "${VMPID:-}" ]; then
     kill "$VMPID" 2>/dev/null
@@ -107,7 +112,11 @@ boot_it() {  # boot_it <mvm binary> <dtb> <disk> <console> <vmm log> <socket>
   # job and nothing in the guest can ask for it yet -- so the number is agreed
   # in advance, and the convention that needs no other agreement is that the
   # vsock port IS the published host port.
-  MVM_VSOCK_IN="$6=1024,tcp:18080=18080" MVM_CONTROL="$out/mvm.ctl" \
+  # An outward route as well: the guest has no network, and the registry it
+  # pulls from is on this machine. 5000 both sides, by the same convention the
+  # published ports use -- whoever opened the host's end chose the number.
+  MVM_VSOCK_IN="$6=1024,tcp:18080=18080" MVM_VSOCK_OUT="5000=tcp:5000" \
+  MVM_CONTROL="$out/mvm.ctl" \
   MVM_TIMEOUT_MS=$((SECS * 1000 + 60000)) \
       "$1" "$IMAGE_FILE" "$2" "" "$3" > "$4" 2> "$5" &
   VMPID=$!
@@ -226,6 +235,39 @@ i=0; while [ "$i" -lt 30 ] && lsof -nP -iTCP:19090 >/dev/null 2>&1; do sleep 0.5
 lsof -nP -iTCP:19090 >/dev/null 2>&1 && { echo "  FAIL  the port outlived the container"; fail=1; } \
   || echo "  ok    and closes again when the container goes"
 kill "$MPPID" 2>/dev/null; wait "$MPPID" 2>/dev/null; MPPID=""
+
+echo "== pulling from a registry on the host =="
+# The guest has no network interface at all, so a registry is reached the only
+# way anything outside is: over vsock. mreg runs here, the guest's forwarder
+# carries 127.0.0.1:5000 out, and the VMM decides where that vsock port leads.
+#
+# Seeded over the distribution API rather than with `docker push`, because the
+# daemon that would do the pushing lives in a virtual machine of its own where
+# "localhost" is that machine and not this one.
+rm -rf "$out/regroot"; mkdir -p "$out/regroot"
+"$out/mreg" 5000 "$out/regroot" > "$out/mreg.log" 2>&1 &
+MREGPID=$!
+i=0; while [ "$i" -lt 40 ] && ! curl -s -o /dev/null "http://127.0.0.1:5000/v2/"; do sleep 0.25; i=$((i + 1)); done
+curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:5000/v2/" | grep -q 200
+say $? "a registry is running on the host"
+python3 "$here/tools/seed-registry.py" "$out/alpine.tar" http://127.0.0.1:5000 gate/alpine v1 > "$out/seed.log" 2>&1
+say $? "seeded with an image, over the distribution API"
+pulled=$(d pull 127.0.0.1:5000/gate/alpine:v1 2>&1 | tail -1)
+case "$pulled" in *gate/alpine:v1*) echo "  ok    docker pull, out of that registry and into the VM";; \
+                  *) echo "  FAIL  docker pull: $pulled"; fail=1;; esac
+d images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^127.0.0.1:5000/gate/alpine:v1$"
+say $? "the pulled image is listed"
+po=$(d run --network host 127.0.0.1:5000/gate/alpine:v1 echo pulled-and-ran-in-mvm 2>/dev/null)
+[ "$po" = "pulled-and-ran-in-mvm" ]; say $? "and a container runs from it ($po)"
+# A name rather than an address: this guest has no resolver, and the daemon has
+# to say which of the two things went wrong rather than "cannot fetch".
+# It went out through the VMM's route rather than some other way. Without this
+# the section would pass against a guest that had a network after all.
+grep -qa "^mvm: vsock outward stream, guest port .* to port 5000 -> tcp:5000" "$vmmlog"
+say $? "the bytes left through the route this VMM was given"
+byname=$(d pull localhost:5000/gate/alpine:v1 2>&1 | tail -1)
+case "$byname" in *"cannot resolve that name"*) echo "  ok    and a name it cannot resolve is refused by name";; \
+                  *) echo "  FAIL  a name gave: $byname"; fail=1;; esac
 
 echo "== a client that hangs up must not take the VMM with it =="
 # The default action for SIGPIPE is to kill the process, and a VMM that dies

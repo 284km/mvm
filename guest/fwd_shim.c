@@ -30,6 +30,38 @@ int fw_listen(int port) {
 }
 
 int fw_accept(int fd) { int c = accept(fd, 0, 0); return c < 0 ? -1 : c; }
+
+/* The other direction. Something in this guest wants to reach the host -- a
+ * registry, say -- and has no network to do it on. It connects to a port on
+ * this machine's loopback, which is here, and this carries it out on vsock.
+ *
+ * The VMM decides where a vsock port leads; this only says which one. */
+int fw_listen_local(int port) {
+    struct sockaddr_in in;
+    memset(&in, 0, sizeof in);
+    in.sin_family = AF_INET;
+    in.sin_addr.s_addr = htonl(INADDR_ANY);   /* the guest's own, not the world's */
+    in.sin_port = htons((unsigned short)port);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(fd, (struct sockaddr *)&in, sizeof in) < 0) { close(fd); return -1; }
+    if (listen(fd, 16) < 0) { close(fd); return -1; }
+    return fd;
+}
+
+int fw_connect_vsock(int port) {
+    struct sockaddr_vm a;
+    memset(&a, 0, sizeof a);
+    a.svm_family = AF_VSOCK;
+    a.svm_cid = VMADDR_CID_HOST;      /* 2 */
+    a.svm_port = (unsigned)port;
+    int fd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) < 0) { close(fd); return -1; }
+    return fd;
+}
 static int fw_connect_local(int port);
 int fw_close(int fd) { return close(fd); }
 

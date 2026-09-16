@@ -32,6 +32,13 @@ cp /opt/mrun /usr/local/bin/mrun && chmod 755 /usr/local/bin/mrun
 cp /opt/mfwd /usr/local/bin/mfwd && chmod 755 /usr/local/bin/mfwd
 chmod 1777 /tmp
 
+# Loopback. Nothing else brings it up in here -- the runtime raises it inside a
+# container's own namespace, and this machine's own is a different interface.
+# Without it 127.0.0.1 is unreachable, which is where everything in this guest
+# talks to everything else in it.
+ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up 2>/dev/null
+say "loopback is $(ip -o link show lo 2>/dev/null | grep -o 'state [A-Z]*' || echo 'unknown')"
+
 # The daemon's own output goes to a file, and a tail carries it to the console.
 # HOW IT ENDS is reported separately, because that is the one line that never
 # appears in its output: a signal has no last words, and 139 and 134 and 1 are
@@ -43,7 +50,20 @@ mkdir -p /var/log
 # said last -- which is the only part worth having when it stops.
 CON=/dev/ttyAMA0
 [ -c "$CON" ] || CON=/dev/kmsg
-( MENGD_TRACE=1 /opt/mengd vsock://1024 /var/lib/mengd /usr/local/bin/mrun \
+( # Outward routes. MVM_FWD_OUT is "<vsock port>:<local port>[,...]" on the
+# kernel command line. Something in here with no network -- the daemon pulling
+# from a registry, say -- connects to that local port and the forwarder carries
+# it out on vsock, where the VMM decides what it reaches.
+if [ -n "${MVM_FWD_OUT:-}" ]; then
+  echo "$MVM_FWD_OUT" | tr ',' ' ' | tr ' ' '\n' | while read -r m; do
+    [ -n "$m" ] || continue
+    v=${m%%:*}; l=${m##*:}
+    ( /usr/local/bin/mfwd out "$v" "$l" 2>&1 | while read -r x; do echo "mfwd: $x" > "$CON"; done ) &
+  done
+  say "outward forwarders started for $MVM_FWD_OUT"
+fi
+
+MENGD_TRACE=1 /opt/mengd vsock://1024 /var/lib/mengd /usr/local/bin/mrun \
     >> /var/log/mengd.log 2>&1
   echo "mengd EXITED with status $?" >> /var/log/mengd.log ) &
 ( tail -f /var/log/mengd.log | while read -r l; do echo "mengd: $l" > "$CON"; done ) &

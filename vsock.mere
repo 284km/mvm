@@ -414,6 +414,31 @@ let vs_pump = fn (s) ->
 
 // ---- the guest's side of a stream -----------------------------------------
 
+// Where an outward connection to this guest port goes.
+//
+// "<port>=<address>,<port>=<address>", or a bare address, which every port
+// takes -- which is what one outward path used to mean and is what the vsock
+// gate still passes. An address is a filesystem path or "tcp:<port>".
+//
+// A table rather than one path because the guest has more than one reason to
+// reach out: a registry is not the same thing as whatever else is listening,
+// and the port it asks for is how it says which.
+let vs_out_for = fn (spec: str) -> fn (port: int) ->
+  if str_len spec == 0 then ""
+  else if str_index_of spec "=" < 0 then spec
+  else
+    let want = show port ++ "=" in
+    let rec go = fn (rest: str) ->
+      if str_len rest == 0 then ""
+      else
+        let comma = str_index_of rest "," in
+        let one = if comma < 0 then rest else substring rest 0 comma in
+        let more = if comma < 0 then "" else substring rest (comma + 1) (str_len rest) in
+        if str_len one > str_len want && substring one 0 (str_len want) == want
+        then substring one (str_len want) (str_len one)
+        else go more in
+    go spec;
+
 let vs_tx_one = fn (s) -> fn (path: str) -> fn (head: int) ->
   let tbl = qget s q_tx q_desc in
   let a0 = d_addr tbl head in
@@ -441,9 +466,9 @@ let vs_tx_one = fn (s) -> fn (path: str) -> fn (head: int) ->
     if op == op_request then
       // Outward: the guest is asking for a stream to a host path.
       (if i >= 0 then let _ = vs_ctl s i op_rst 0 in 0
-       else if str_len path == 0 then
+       else if str_len (vs_out_for path dst_port) == 0 then
          let _ = print_err ("mvm: vsock port " ++ show dst_port
-                         ++ ": this VMM was given no outward path") in
+                         ++ ": this VMM has no outward route for it") in
          let _ = vs_ctl_ports s dst_port src_port op_rst 0 0 in 0
        else
          let j = vs_alloc s in
@@ -452,10 +477,11 @@ let vs_tx_one = fn (s) -> fn (path: str) -> fn (head: int) ->
                            ++ show vs_smax ++ " streams are in use") in
            let _ = vs_ctl_ports s dst_port src_port op_rst 0 0 in 0
          else
-           let h = hv_vs_connect path in
+           let dest = vs_out_for path dst_port in
+           let h = hv_vs_connect dest in
            if h < 0 then
              let _ = print_err ("mvm: vsock port " ++ show dst_port
-                             ++ ": nothing listening at " ++ path) in
+                             ++ ": nothing listening at " ++ dest) in
              let _ = vs_ctl_ports s dst_port src_port op_rst 0 0 in 0
            else
              let _ = sset s j s_handle h in
@@ -468,7 +494,7 @@ let vs_tx_one = fn (s) -> fn (path: str) -> fn (head: int) ->
              let _ = sset s j s_st st_open in
              let _ = print_err ("mvm: vsock outward stream, guest port "
                              ++ show (bit_and src_port 0xffffffff)
-                             ++ " to port " ++ show dst_port) in
+                             ++ " to port " ++ show dst_port ++ " -> " ++ dest) in
              let _ = vs_ctl s j op_response 0 in 0)
     else if i < 0 then
       // A packet for a stream this end does not have. Answered rather than

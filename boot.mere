@@ -161,7 +161,11 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
   // device is still present -- the guest is told there is nothing listening,
   // which is a different answer from the device not being there at all.
   let vs = vs_new () in
-  let vspath = env_or "MVM_VSOCK" in
+  // Outward routes. MVM_VSOCK_OUT is a table -- "<guest port>=<address>,..." --
+  // and MVM_VSOCK is the older spelling of "one address, every port", which
+  // the vsock gate still uses.
+  let vspath = let t = env_or "MVM_VSOCK_OUT" in
+               if str_len t > 0 then t else env_or "MVM_VSOCK" in
   // MVM_VSOCK_IN is a list: "<path>=<guest port>,<path>=<guest port>". A bare
   // path takes MVM_VSOCK_PORT, which is what one socket used to mean. Several
   // exist because a docker socket and a forwarded port arrive the same way and
@@ -187,7 +191,7 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
                (let _ = print_err ("mvm: control socket at " ++ ctlpath) in ())
              else (let _ = print_err ("mvm: cannot open a control socket at " ++ ctlpath) in ()))
           else () in
-  let _ = if str_len vspath > 0 then print_err ("mvm: vsock host end " ++ vspath) else () in
+  let _ = if str_len vspath > 0 then print_err ("mvm: vsock outward " ++ vspath) else () in
   let disk_sectors = if str_len disk == 0 then 0 else file_size disk / 512 in
   let _ = if str_len disk > 0 then
             print_err ("mvm: disk " ++ disk ++ " (" ++ show disk_sectors ++ " sectors)")

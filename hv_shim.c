@@ -393,19 +393,35 @@ static void vs_init(void) {
 }
 static int vs_ok(int h) { vs_init(); return h >= 0 && h < VS_MAX && VS_FD[h] >= 0; }
 
-/* Connect to a host AF_UNIX path. A small handle, or -1. */
+/* Connect to something on the host: a filesystem path, or "tcp:<port>" on the
+ * loopback. Both are places a host program is listening; which one a route
+ * uses is the caller's fact, and a registry is naturally the second. */
 int hv_vs_connect(const char *path) {
     vs_init();
     int h = -1;
     for (int i = 0; i < VS_MAX; i++) if (VS_FD[i] < 0) { h = i; break; }
     if (h < 0) return -1;
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd;
+    if (!strncmp(path, "tcp:", 4)) {
+        int port = atoi(path + 4);
+        if (port <= 0 || port > 65535) return -4;
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        struct sockaddr_in in;
+        memset(&in, 0, sizeof in);
+        in.sin_family = AF_INET;
+        in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        in.sin_port = htons((uint16_t)port);
+        if (connect(fd, (struct sockaddr *)&in, sizeof in) != 0) { close(fd); return -1; }
+    } else {
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     struct sockaddr_un a;
     memset(&a, 0, sizeof a);
     a.sun_family = AF_UNIX;
     snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
     if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    }
     int fl = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
     VS_FD[h] = fd;
