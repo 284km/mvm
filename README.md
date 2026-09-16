@@ -1,9 +1,22 @@
 # mvm
 
 A virtual machine monitor in [Mere](https://merelang.org/), on Apple's
-Hypervisor.framework. **A real Linux kernel boots on it**, prints 275 lines
-through an emulated PL011, and panics because there is no root filesystem —
-which is the one thing this VMM does not provide yet.
+Hypervisor.framework. **A real Linux kernel boots on it and runs userspace** —
+Alpine's busybox as pid 1, mounting filesystems and powering the machine down
+through PSCI.
+
+```
+[    0.153470] Run /init as init process
+[    0.161653] userspace: devtmpfs is mounted and kmsg is writable
+[    0.162770] userspace: uname Linux 6.8.0-117-generic aarch64
+[    0.163771] userspace: pid 1 uid 0
+[    0.165255] userspace: root has 18 entries
+[    0.166320] reboot: Power down
+mvm: guest called PSCI SYSTEM_OFF
+```
+
+Without an initramfs it boots the same way and panics because there is no root
+filesystem, which is the one thing this VMM does not provide yet.
 
 ```
 [    0.000000] Booting Linux on physical CPU 0x0000000000 [0x610f0000]
@@ -17,8 +30,10 @@ mvm: guest called PSCI SYSTEM_RESET
 ```
 
 ```sh
-sh test/boot.sh      # needs an arm64 Image in .build/Image
-sh test/run.sh       # the one-instruction check below
+sh initrd/build.sh   # an initramfs from a container image, with the init below
+sh test/init.sh      # userspace runs
+sh test/boot.sh      # the kernel boots and panics for the right reason
+sh test/run.sh       # the one-instruction check
 ```
 
 **A panic is the judgement on purpose.** It means the CPU, the memory map, the
@@ -117,9 +132,27 @@ No developer account and no notarisation. Homebrew signs `qemu` the same way for
 `com.apple.security.hypervisor`, which is how this was checked before any of it
 was written.
 
+### The exit status was the only channel, and it was enough
+
+Before `/dev` exists, init has no stdout: the kernel opens `/dev/console` for
+it, and a root filesystem exported from a container image has no device nodes,
+because a container runtime makes those. So init ran perfectly and said nothing,
+and the kernel reported `Attempted to kill init! exitcode=0x00000100` — a
+message about a shell exiting 1 that says nothing about why.
+
+The init script gives each step a number and exits with it. `mkdir` failing is
+21, the `devtmpfs` mount failing is 22, a missing `/dev/kmsg` is 23. The kernel
+prints the number, and the number says which step. The test checks those numbers
+do **not** appear, because each of them is a specific failure rather than a
+general one.
+
+The actual cause was one step earlier than any of them: `2>/dev/null` on the
+first line, opening a file that does not exist yet.
+
 ## What it does not do
 
-No block device, so nothing to mount — the panic above. No network, no console
+No block device: userspace here is an initramfs, which the kernel unpacks
+into memory. A root filesystem on a disk needs virtio-blk, which is next. No network, no console
 input, no SMP: PSCI answers `NOT_SUPPORTED` to everything except the two calls
 that end the machine. System registers this VMM does not emulate read as zero
 and drop writes, which is what every VMM does with the debug and trace

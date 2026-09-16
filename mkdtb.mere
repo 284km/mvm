@@ -25,7 +25,12 @@ let gic_redist  = 0x80a0000;
 let phandle_gic = 1;
 let phandle_clk = 2;
 
+// The initrd's bounds go in /chosen. The kernel reads them as a number of
+// whatever width the property is, so two cells is a 64-bit address and one is
+// a 32-bit one; two is written here because the rest of this tree is 64-bit
+// and a tree that mixes them for no reason is a tree someone will misread.
 let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) ->
+            fn (initrd_start: int) -> fn (initrd_end: int) ->
   let st = bytebuf_new 0 in
   let strs = bytebuf_new 0 in
   let bn = begin_node st in
@@ -45,6 +50,10 @@ let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) -
     let _ = bn "chosen" in
       let _ = ps "bootargs" bootargs in
       let _ = ps "stdout-path" "/pl011@9000000" in
+      let _ = if initrd_end > initrd_start then
+                (let _ = pc "linux,initrd-start" [0, initrd_start] in
+                 let _ = pc "linux,initrd-end" [0, initrd_end] in ())
+              else () in
     let _ = en () in
 
     // reg is <hi lo hi lo> because #address-cells and #size-cells are 2.
@@ -107,6 +116,15 @@ let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) -
   fdt_finish st strs;
 
 match args () with
+| [out, initrd_start, initrd_end] ->
+    let _ = hv_up () in
+    let ds = hv_gic_dist_size () in
+    let rs = hv_gic_redist_size () in
+    let _ = if ds <= 0 then let _ = print_err "mkdtb: no distributor size" in exit 1 else 0 in
+    let b = build "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 rdinit=/init"
+                  ds rs (int_of_str initrd_start) (int_of_str initrd_end) in
+    let _ = write_bytes out b in
+    print_err ("mkdtb: wrote " ++ out ++ " with an initrd")
 | [out] ->
     // A VM has to exist before the framework will answer for its GIC.
     let _ = hv_up () in
@@ -114,7 +132,7 @@ match args () with
     let rs = hv_gic_redist_size () in
     let _ = if ds <= 0 then let _ = print_err "mkdtb: the framework would not give a distributor size" in exit 1 else 0 in
     let _ = if rs <= 0 then let _ = print_err "mkdtb: the framework would not give a redistributor size" in exit 1 else 0 in
-    let b = build "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1" ds rs in
+    let b = build "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1" ds rs 0 0 in
     let _ = write_bytes out b in
     print_err ("mkdtb: wrote " ++ out ++ "  (gic dist 0x" ++ show ds ++ ", redist 0x" ++ show rs ++ ")")
 | _ -> let _ = print_err "usage: mkdtb <out.dtb>" in exit 2

@@ -33,6 +33,7 @@ let ram_base = 0x40000000;
 let ram_bytes = 1073741824;                 // 1 GiB, and the kernel wants 60 MiB of it
 let dtb_gpa = 0x48000000;                   // above the kernel image, 2 MiB aligned
 let dtb_gpa_hex = "0x48000000";
+let initrd_gpa_hex = "0x4a000000";
 let uart_base = 0x9000000;
 let gic_dist_hex = "0x8000000";
 let gic_redist_hex = "0x80a0000";
@@ -78,7 +79,7 @@ let ec_sysreg = 0x18;
 let iss_is_write = fn (iss: int) -> bit_and (bit_shr iss 6) 1 == 1;
 let iss_reg = fn (iss: int) -> bit_and (bit_shr iss 16) 31;
 
-let boot = fn (image: str) -> fn (dtb: str) ->
+let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) ->
   let _ = must "hv_vm_create" (hv_up ()) in
   let _ = must "hv_vm_map" (hv_map ram_base_hex ram_bytes) in
   // The GIC has to exist before the vCPU, and at the addresses the device tree
@@ -87,6 +88,14 @@ let boot = fn (image: str) -> fn (dtb: str) ->
 
   let n1 = hv_load_file image ram_base_hex in
   let _ = if n1 <= 0 then let _ = print_err "mvm: cannot load the kernel image" in exit 1 else 0 in
+  // The initrd, if one was given, goes above the kernel and below the dtb's
+  // neighbourhood. Its bounds are in the tree, so the two have to agree -- and
+  // they do because the same program computed both.
+  let _ = if str_len initrd > 0 then
+            (let n3 = hv_load_file initrd initrd_gpa_hex in
+             if n3 <= 0 then let _ = print_err "mvm: cannot load the initrd" in exit 1
+             else let _ = print_err ("mvm: initrd " ++ show n3 ++ " bytes at " ++ initrd_gpa_hex) in 0)
+          else 0 in
   let n2 = hv_load_file dtb dtb_gpa_hex in
   let _ = if n2 <= 0 then let _ = print_err "mvm: cannot load the device tree" in exit 1 else 0 in
   let _ = print_err ("mvm: kernel " ++ show n1 ++ " bytes, dtb " ++ show n2 ++ " bytes") in
@@ -191,5 +200,6 @@ let boot = fn (image: str) -> fn (dtb: str) ->
   ();
 
 match args () with
-| [image, dtb] -> boot image dtb
-| _ -> let _ = print_err "usage: mvm-boot <Image> <dtb>" in exit 2
+| [image, dtb] -> boot image dtb ""
+| [image, dtb, initrd] -> boot image dtb initrd
+| _ -> let _ = print_err "usage: mvm-boot <Image> <dtb> [initrd]" in exit 2

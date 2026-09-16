@@ -1,0 +1,16 @@
+#!/bin/sh
+# The exit status is the only channel until /dev exists, so each step gets a
+# number: the kernel prints "Attempted to kill init! exitcode=0xNN00".
+mkdir -p /dev || exit 21
+mount -t devtmpfs dev /dev || exit 22
+[ -c /dev/kmsg ] || exit 23
+echo "userspace: devtmpfs is mounted and kmsg is writable" > /dev/kmsg || exit 24
+mkdir -p /proc /sys 2>/dev/null
+mount -t proc proc /proc 2>/dev/null || echo "userspace: no proc" > /dev/kmsg
+mount -t sysfs sys /sys 2>/dev/null || echo "userspace: no sysfs" > /dev/kmsg
+echo "userspace: uname $(uname -srm)" > /dev/kmsg
+echo "userspace: pid $$ uid $(id -u)" > /dev/kmsg
+echo "userspace: root has $(ls / | wc -l) entries" > /dev/kmsg
+echo "userspace: init is done" > /dev/kmsg
+poweroff -f
+exit 99
