@@ -325,6 +325,13 @@ ok
 An address, not a name: there is no resolver in there, and the daemon says
 which of the two things went wrong rather than "cannot fetch the manifest".
 
+**Over TLS as well**, with the certificate verified against an authority the
+guest carries. `test/stack.sh` asks all three states of that policy: a registry
+it may speak to in the clear because it was named, one whose certificate checks
+out, and one signed by an authority the guest does not have — which is refused,
+and nothing from it reaches the store. The third needs its own authority, which
+is why `tools/make-certs.sh` makes two.
+
 ## Three programs and one number
 
 A published port needs all three, and each knows something the others cannot:
@@ -357,9 +364,10 @@ ports. Two VMs would need the control socket to say which — and that is the
 first thing here that would benefit from a name rather than a number.
 
 **A registry it can reach on its own.** Pulling works against a registry on
-this machine. Docker Hub needs token authentication and TLS, which the daemon
-refuses by name today, and that is what stands between this and never needing
-another container runtime to fetch an image.
+this machine, in the clear or over TLS. Docker Hub needs two more things: token
+authentication, and a route that leads off this machine — the outward table
+reaches the loopback here and nothing further. Those are what stand between
+this and never needing another container runtime to fetch an image.
 
 The language change this project expected never arrived. `Raw`, Mere's window
 type for physical memory, was going to need a second source so that a virtio

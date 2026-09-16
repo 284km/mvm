@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/seed-registry.py -- put an image into a registry, over the API.
 
-    seed-registry.py <docker-save tar> <base url> <repo> <tag>
+    seed-registry.py <docker-save tar> <base url> <repo> <tag> [ca.pem]
 
 WHY NOT `docker push`. The daemon that would do the pushing lives in a virtual
 machine of its own, where "localhost" is that machine and not this one, so it
@@ -14,7 +14,9 @@ asked for and pushes THAT, so what lands under the tag is a plain manifest.
 The daemon being tested can read an index too; pushing one here would be
 testing the seeder's choices rather than the daemon's.
 """
-import json, sys, tarfile, urllib.request, urllib.error
+import json, ssl, sys, tarfile, urllib.request, urllib.error
+
+CTX = None      # a CA to trust instead of the system store, for a test registry
 
 def req(method, url, data=None, ctype=None, headers=None):
     h = dict(headers or {})
@@ -22,14 +24,17 @@ def req(method, url, data=None, ctype=None, headers=None):
         h["Content-Type"] = ctype
     r = urllib.request.Request(url, data=data, method=method, headers=h)
     try:
-        return urllib.request.urlopen(r)
+        return urllib.request.urlopen(r, context=CTX)
     except urllib.error.HTTPError as e:
         return e
 
 def main():
-    if len(sys.argv) != 5:
+    global CTX
+    if len(sys.argv) not in (5, 6):
         sys.exit(__doc__)
-    tar_path, base, repo, tag = sys.argv[1:]
+    tar_path, base, repo, tag = sys.argv[1:5]
+    if len(sys.argv) == 6:
+        CTX = ssl.create_default_context(cafile=sys.argv[5])
     base = base.rstrip("/")
     plat = ("linux", "arm64")
 

@@ -33,6 +33,17 @@ for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
   [ -r "$VSMOD/$m.ko" ] || { echo "no $m.ko in $VSMOD -- see test/vsock.sh" >&2; exit 2; }
 done
 IMG="${IMG:-gcc:14}"
+# A toolchain image with OpenSSL in it, built once and then cached. The daemon
+# links it because it declares the TLS primitives, and a static link needs zlib
+# and zstd as well -- which is not obvious until the linker asks for `inflate`
+# and `ZSTD_decompressStream`.
+BUILD_IMG="mvm-build:1"
+docker image inspect "$BUILD_IMG" >/dev/null 2>&1 || docker build -q -t "$BUILD_IMG" - >/dev/null 2>&1 <<DOCKERFILE
+FROM $IMG
+RUN apt-get -qq update && apt-get -qq install -y libssl-dev zlib1g-dev libzstd-dev \
+ && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+docker image inspect "$BUILD_IMG" >/dev/null 2>&1 || { echo "cannot build the toolchain image" >&2; exit 1; }
 # How long the guest stays up. An upper bound, not a cost: the gate kills the
 # VM when it is done. It has to outlast everything below, and 45 did not --
 # the run died in the middle of creating a container and four checks went red
@@ -45,8 +56,9 @@ echo "== build the guest's userspace =="
 mkdir -p "$out/extra-mengd" "$MENGD_SRC/.build" "$MRUN_SRC/.build"
 "$M" -c "$MENGD_SRC/mengd.mere" > "$MENGD_SRC/.build/mengd.c" 2>"$out/e1" || { echo FAIL mengd emit; sed -n 1,8p "$out/e1"; exit 1; }
 "$M" -c "$MRUN_SRC/mrun.mere"   > "$MRUN_SRC/.build/mrun.c"   2>"$out/e2" || { echo FAIL mrun emit;  sed -n 1,8p "$out/e2"; exit 1; }
-docker run --rm -v "$MENGD_SRC:/w" -w /w "$IMG" \
-  cc -O2 -static -o .build/mengd-linux .build/mengd.c unix_shim.c fs_shim.c store_shim.c >/dev/null 2>&1
+docker run --rm -v "$MENGD_SRC:/w" -w /w "$BUILD_IMG" \
+  cc -O2 -static -o .build/mengd-linux .build/mengd.c unix_shim.c fs_shim.c store_shim.c \
+     -lssl -lcrypto -lz -lzstd -ldl -lpthread >/dev/null 2>&1
 docker run --rm -v "$MRUN_SRC:/w" -w /w "$IMG" \
   cc -O2 -static -o .build/mrun-linux .build/mrun.c linux_shim.c >/dev/null 2>&1
 [ -x "$MENGD_SRC/.build/mengd-linux" ] && [ -x "$MRUN_SRC/.build/mrun-linux" ]
@@ -54,6 +66,8 @@ say $? "mengd and mrun, built for the guest"
 cp "$VSMOD"/*.ko "$out/extra-mengd/" 2>/dev/null
 cp "$MENGD_SRC/.build/mengd-linux" "$out/extra-mengd/mengd"
 cp "$MRUN_SRC/.build/mrun-linux" "$out/extra-mengd/mrun"
+sh "$here/tools/make-certs.sh" "$out/certs" >/dev/null 2>&1
+cp "$out/certs/trusted-ca.pem" "$out/extra-mengd/ca.pem"
 "$M" -c "$here/guest/mfwd.mere" > "$out/mfwd.c" 2>"$out/e5" || { echo FAIL mfwd emit; sed -n 1,8p "$out/e5"; exit 1; }
 docker run --rm -v "$out:/o" -v "$here/guest:/g:ro" -w /o "$IMG" \
   cc -O2 -static -o /o/mfwd-linux /o/mfwd.c /g/fwd_shim.c >/dev/null 2>&1
@@ -61,7 +75,10 @@ cp "$out/mfwd-linux" "$out/extra-mengd/mfwd"
 "$M" -c "$here/mports.mere" > "$out/mports.c" 2>"$out/e6" || { echo FAIL mports emit; sed -n 1,8p "$out/e6"; exit 1; }
 cc -O2 -o "$out/mports" "$out/mports.c" "$here/mports_shim.c" 2>/dev/null || { echo FAIL cc mports; exit 1; }
 "$M" -c "$MREG_SRC/mreg.mere" > "$out/mreg.c" 2>"$out/e7" || { echo FAIL mreg emit; sed -n 1,8p "$out/e7"; exit 1; }
-cc -O2 -o "$out/mreg" "$out/mreg.c" "$MREG_SRC/reg_shim.c" 2>/dev/null || { echo FAIL cc mreg; exit 1; }
+SSLPREFIX="$(brew --prefix openssl@3 2>/dev/null || echo /opt/homebrew/opt/openssl@3)"
+cc -O2 -o "$out/mreg" "$out/mreg.c" "$MREG_SRC/reg_shim.c" \
+   -I"$SSLPREFIX/include" -L"$SSLPREFIX/lib" -lssl -lcrypto 2>/dev/null \
+  || { echo FAIL cc mreg; exit 1; }
 chmod 755 "$out/extra-mengd/mengd" "$out/extra-mengd/mrun" "$out/extra-mengd/mfwd"
 
 echo "== build the VMM and a root filesystem =="
@@ -76,7 +93,7 @@ DOCKER_HOST= docker pull -q alpine:latest >/dev/null 2>&1
 DOCKER_HOST= docker save alpine:latest -o "$out/alpine.tar" 2>/dev/null
 [ -r "$out/alpine.tar" ]; say $? "an image for the guest to load"
 
-ROOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/init MENGD_SECONDS=$SECS MVM_FWD_OUT=5000:5000"
+ROOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/init MENGD_SECONDS=$SECS MVM_FWD_OUT=5000:5000,5443:5443,5444:5444 MENGD_INSECURE=127.0.0.1:5000"
 # Stopping one has to stop the PROCESS, not the shell that started it. `( cmd )
 # &` gives back the subshell's pid, and killing that can leave the VM running --
 # which is not a tidy-up problem: the next section binds the same host port,
@@ -115,7 +132,8 @@ boot_it() {  # boot_it <mvm binary> <dtb> <disk> <console> <vmm log> <socket>
   # An outward route as well: the guest has no network, and the registry it
   # pulls from is on this machine. 5000 both sides, by the same convention the
   # published ports use -- whoever opened the host's end chose the number.
-  MVM_VSOCK_IN="$6=1024,tcp:18080=18080" MVM_VSOCK_OUT="5000=tcp:5000" \
+  MVM_VSOCK_IN="$6=1024,tcp:18080=18080" \
+  MVM_VSOCK_OUT="5000=tcp:5000,5443=tcp:5443,5444=tcp:5444" \
   MVM_CONTROL="$out/mvm.ctl" \
   MVM_TIMEOUT_MS=$((SECS * 1000 + 60000)) \
       "$1" "$IMAGE_FILE" "$2" "" "$3" > "$4" 2> "$5" &
@@ -255,6 +273,9 @@ say $? "seeded with an image, over the distribution API"
 pulled=$(d pull 127.0.0.1:5000/gate/alpine:v1 2>&1 | tail -1)
 case "$pulled" in *gate/alpine:v1*) echo "  ok    docker pull, out of that registry and into the VM";; \
                   *) echo "  FAIL  docker pull: $pulled"; fail=1;; esac
+# That one was in MENGD_INSECURE. Plaintext is opt-in by host and port, the way
+# docker does it, because the wrong default here is not a slower pull -- it is
+# a manifest anyone on the path can replace.
 d images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -q "^127.0.0.1:5000/gate/alpine:v1$"
 say $? "the pulled image is listed"
 po=$(d run --network host 127.0.0.1:5000/gate/alpine:v1 echo pulled-and-ran-in-mvm 2>/dev/null)
@@ -268,6 +289,35 @@ say $? "the bytes left through the route this VMM was given"
 byname=$(d pull localhost:5000/gate/alpine:v1 2>&1 | tail -1)
 case "$byname" in *"cannot resolve that name"*) echo "  ok    and a name it cannot resolve is refused by name";; \
                   *) echo "  FAIL  a name gave: $byname"; fail=1;; esac
+
+echo "== the same, over TLS =="
+# Three states, and the third needs an authority the guest does not have.
+rm -rf "$out/tlsroot" "$out/badroot"; mkdir -p "$out/tlsroot" "$out/badroot"
+"$out/mreg" 5443 "$out/tlsroot" "$out/certs/trusted.pem" "$out/certs/trusted.key" > "$out/mreg-tls.log" 2>&1 &
+MREGTLS=$!
+"$out/mreg" 5444 "$out/badroot" "$out/certs/untrusted.pem" "$out/certs/untrusted.key" > "$out/mreg-bad.log" 2>&1 &
+MREGBAD=$!
+i=0; while [ "$i" -lt 40 ] && ! curl -s -k -o /dev/null "https://127.0.0.1:5443/v2/"; do sleep 0.25; i=$((i + 1)); done
+curl -s --cacert "$out/certs/trusted-ca.pem" -o /dev/null -w '%{http_code}' "https://127.0.0.1:5443/v2/" | grep -q 200
+say $? "a registry is serving HTTPS on the host"
+python3 "$here/tools/seed-registry.py" "$out/alpine.tar" https://127.0.0.1:5443 gate/tls v1 "$out/certs/trusted-ca.pem" > "$out/seed-tls.log" 2>&1
+say $? "seeded over TLS"
+python3 "$here/tools/seed-registry.py" "$out/alpine.tar" https://127.0.0.1:5444 gate/bad v1 "$out/certs/untrusted-ca.pem" > "$out/seed-bad.log" 2>&1
+say $? "and so is one signed by an authority the guest does not have"
+tlspull=$(d pull 127.0.0.1:5443/gate/tls:v1 2>&1 | tail -1)
+case "$tlspull" in *gate/tls:v1*) echo "  ok    docker pull over TLS, certificate verified";; \
+                   *) echo "  FAIL  TLS pull: $tlspull"; fail=1;; esac
+to=$(d run --network host 127.0.0.1:5443/gate/tls:v1 echo pulled-over-tls 2>/dev/null)
+[ "$to" = "pulled-over-tls" ]; say $? "and a container runs from it ($to)"
+# The one that matters. A certificate that does not check out is a REFUSAL,
+# not a fallback: whoever can break the handshake can make it fail.
+badpull=$(d pull 127.0.0.1:5444/gate/bad:v1 2>&1 | tail -1)
+case "$badpull" in *"cannot verify"*) echo "  ok    and one it cannot verify is refused, by name";; \
+                   *) echo "  FAIL  an unverifiable registry gave: $badpull"; fail=1;; esac
+d images --format '{{.Repository}}' 2>/dev/null | grep -q "5444" \
+  && { echo "  FAIL  the unverified image was pulled anyway"; fail=1; } \
+  || echo "  ok    and nothing from it reached the store"
+kill "$MREGTLS" "$MREGBAD" 2>/dev/null; wait "$MREGTLS" 2>/dev/null; wait "$MREGBAD" 2>/dev/null
 
 echo "== a client that hangs up must not take the VMM with it =="
 # The default action for SIGPIPE is to kill the process, and a VMM that dies

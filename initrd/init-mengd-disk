@@ -63,6 +63,13 @@ if [ -n "${MVM_FWD_OUT:-}" ]; then
   say "outward forwarders started for $MVM_FWD_OUT"
 fi
 
+# A certificate authority to trust, and any registry this machine may speak to
+# in the clear. Both come off the kernel command line, because both are the
+# caller's facts: which registry, and whether it is one this machine has a
+# certificate for.
+[ -r /opt/ca.pem ] && export MENGD_CA=/opt/ca.pem
+[ -n "${MENGD_INSECURE:-}" ] && export MENGD_INSECURE
+
 MENGD_TRACE=1 /opt/mengd vsock://1024 /var/lib/mengd /usr/local/bin/mrun \
     >> /var/log/mengd.log 2>&1
   echo "mengd EXITED with status $?" >> /var/log/mengd.log ) &
