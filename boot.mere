@@ -29,6 +29,7 @@ extern fn hv_advance_pc: unit -> int;
 extern fn hv_mask_vtimer: unit -> int;
 extern fn hv_set_sys: str -> str -> int;
 extern fn now_ms: unit -> int;
+extern fn hv_now_secs: unit -> int;
 extern fn hv_start_deadline: int -> int;
 extern fn hv_deadline_fired: unit -> int;
 extern fn hv_gic_redist_base_of_vcpu: unit -> str;
@@ -40,6 +41,20 @@ let dtb_gpa = 0x48000000;                   // above the kernel image, 2 MiB ali
 let dtb_gpa_hex = "0x48000000";
 let initrd_gpa_hex = "0x4a000000";
 let uart_base = 0x9000000;
+let rtc_base = 0x9010000;
+
+// A PL031. Eight bytes of it are the time and the rest is a PrimeCell's
+// identity, which the AMBA bus reads before it will bind a driver at all.
+// The identity numbers are the ones the part has; inventing them would mean a
+// device tree that promises a PL031 and a device that is not one.
+let rtc_read = fn (off: int) ->
+  if off == 0x000 then hv_now_secs ()            // RTCDR: seconds since the epoch
+  else if off == 0x00c then 1                    // RTCCR: running
+  else if off == 0xfe0 then 0x31 else if off == 0xfe4 then 0x10
+  else if off == 0xfe8 then 0x14 else if off == 0xfec then 0x00
+  else if off == 0xff0 then 0x0d else if off == 0xff4 then 0xf0
+  else if off == 0xff8 then 0x05 else if off == 0xffc then 0xb1
+  else 0;
 let gic_dist_hex = "0x8000000";
 let gic_redist_hex = "0x80a0000";
 
@@ -250,6 +265,19 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
                else
                  let _ = print_err ("mvm: unhandled data abort at " ++ hv_exit_pa ()
                                  ++ " (va " ++ hv_exit_va () ++ ")") in out)
+            else if va >= rtc_base then
+              // Writes are dropped, including RTCLR. A guest setting the clock
+              // would be setting this machine's clock, and the guest does not
+              // own it.
+              (if va < rtc_base + 4096 then
+                 let _ = if iss_is_write iss then ()
+                         else
+                           let r = rtc_read (va - rtc_base) in
+                           let _ = hv_set_x (iss_reg iss) (hexs r) in () in
+                 let _ = hv_advance_pc () in
+                 run (n + 1) out
+               else
+                 let _ = print_err ("mvm: unhandled data abort at " ++ hv_exit_pa ()) in out)
             else if va >= uart_base then
               (if va < uart_base + 4096 then
                  // The PL011's data register is at offset 0; a write there is

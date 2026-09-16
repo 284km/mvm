@@ -15,6 +15,7 @@ import "fdt.mere";
 extern fn hv_up: unit -> int;
 extern fn hv_gic_dist_size: unit -> int;
 extern fn hv_gic_redist_size: unit -> int;
+extern fn hv_now_secs: unit -> int;
 
 let ram_base    = 0x40000000;
 let ram_size_mb = 1024;
@@ -29,6 +30,8 @@ let phandle_clk = 2;
 // whatever width the property is, so two cells is a 64-bit address and one is
 // a 32-bit one; two is written here because the rest of this tree is 64-bit
 // and a tree that mixes them for no reason is a tree someone will misread.
+let rtc_base = 0x9010000;
+
 let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) ->
             fn (initrd_start: int) -> fn (initrd_end: int) ->
   let st = bytebuf_new 0 in
@@ -97,6 +100,18 @@ let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) -
       let _ = pu "phandle" phandle_gic in
     let _ = en () in
 
+    // A real-time clock. Without one the guest starts at the epoch, and every
+    // timestamp it hands out -- a container's Created, a log line's date -- is
+    // 1970. That is not cosmetic: the clients that read those fields parse
+    // them, and "56 years ago" is what a working daemon looks like when it has
+    // no idea what time it is.
+    let _ = bn "pl031@9010000" in
+      let _ = p2 "compatible" "arm,pl031" "arm,primecell" in
+      let _ = pc "reg" [0, rtc_base, 0, 0x1000] in
+      let _ = pc "interrupts" [0, 2, 4] in
+      let _ = pc "clocks" [phandle_clk] in
+      let _ = ps "clock-names" "apb_pclk" in
+    let _ = en () in
     let _ = bn "pl011@9000000" in
       let _ = p2 "compatible" "arm,pl011" "arm,primecell" in
       let _ = pc "reg" [0, uart_base, 0, 0x1000] in
@@ -133,13 +148,31 @@ let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) -
   let _ = en () in
   fdt_finish st strs;
 
+// The command line the kernel is handed. Fixed by default, because two files
+// that have to agree are two files that can disagree -- but a root filesystem
+// on a disk needs `root=`, and that is the caller's fact rather than this
+// program's, so there is one way to say it.
+let bootargs_or = fn (dflt: str) ->
+  let base = match env_var "MVM_BOOTARGS" with
+             | Some v -> if str_len v > 0 then v else dflt
+             | _ -> dflt in
+  // What time it is, told to the guest directly.
+  //
+  // There is a PL031 in the tree, which is the proper way -- but its driver is
+  // a module in a stock kernel and one that is not always installed, and a
+  // guest whose clock reads 1970 hands out timestamps that its clients parse.
+  // An unrecognised key=value on the command line reaches init as an
+  // environment variable, so this works whatever modules exist. Both numbers
+  // come from the same call on this machine, so they cannot disagree.
+  base ++ " MVM_EPOCH=" ++ show (hv_now_secs ());
+
 match args () with
 | [out, initrd_start, initrd_end] ->
     let _ = hv_up () in
     let ds = hv_gic_dist_size () in
     let rs = hv_gic_redist_size () in
     let _ = if ds <= 0 then let _ = print_err "mkdtb: no distributor size" in exit 1 else 0 in
-    let b = build "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 rdinit=/init"
+    let b = build (bootargs_or "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 rdinit=/init")
                   ds rs (int_of_str initrd_start) (int_of_str initrd_end) in
     let _ = write_bytes out b in
     print_err ("mkdtb: wrote " ++ out ++ " with an initrd")
@@ -150,7 +183,7 @@ match args () with
     let rs = hv_gic_redist_size () in
     let _ = if ds <= 0 then let _ = print_err "mkdtb: the framework would not give a distributor size" in exit 1 else 0 in
     let _ = if rs <= 0 then let _ = print_err "mkdtb: the framework would not give a redistributor size" in exit 1 else 0 in
-    let b = build "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1" ds rs 0 0 in
+    let b = build (bootargs_or "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1") ds rs 0 0 in
     let _ = write_bytes out b in
     print_err ("mkdtb: wrote " ++ out ++ "  (gic dist 0x" ++ show ds ++ ", redist 0x" ++ show rs ++ ")")
 | _ -> let _ = print_err "usage: mkdtb <out.dtb>" in exit 2

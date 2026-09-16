@@ -1,7 +1,30 @@
 # mvm
 
 A virtual machine monitor in [Mere](https://merelang.org/), on Apple's
-Hypervisor.framework. **A real Linux kernel boots on it and runs userspace** —
+Hypervisor.framework.
+
+**A real `docker` client runs containers on it.**
+
+```
+$ docker -H unix://.build/docker.sock run alpine sh -c 'echo to-stdout'
+to-stdout
+$ docker -H unix://.build/docker.sock version --format '{{.Server.Version}}/{{.Server.Arch}}'
+0.1.0/linux/arm64
+```
+
+```
+docker (macOS) -> a unix socket -> mvm -> virtio-vsock -> mengd -> mrun -> the container
+```
+
+Everything after the client is Mere: this VMM, the vsock device it carries the
+stream over, [mengd](https://github.com/284km/mengd) answering the Docker
+Engine API inside the guest, and [mrun](https://github.com/284km/mrun) as its
+OCI runtime. No lima, no vz, no Go. `sh test/stack.sh` is the check, and its
+oracle is the client a person actually types at.
+
+---
+
+**A real Linux kernel boots on it and runs userspace** —
 Alpine's busybox as pid 1, mounting filesystems and powering the machine down
 through PSCI.
 
@@ -66,6 +89,7 @@ mvm: guest called PSCI SYSTEM_RESET
 
 ```sh
 sh initrd/build.sh   # an initramfs from a container image, with the init below
+sh test/stack.sh     # a real docker client runs a container inside this VMM
 sh test/vsock.sh     # the guest and a host program hold a conversation, both ways
 sh test/disk.sh      # virtio-blk, judged from both ends
 sh test/init.sh      # userspace runs
@@ -225,12 +249,30 @@ and drop writes, which is what every VMM does with the debug and trace
 registers a kernel touches on the way up, and is also a place where a guest
 could be quietly misled.
 
+## Two things the integration said that nothing before it could
+
+**A root filesystem has to be a filesystem.** `pivot_root` refuses when the
+current root is the initramfs — `mrun: pivot_root (errno 22)` — so a container
+runtime cannot enter a container there at all. The daemon comes up, answers
+every route, and creates containers that never run. `tools/mkrootfs.sh` builds
+an ext4 image with `mke2fs -d`, which needs no privilege and no mounting, and
+the guest boots `root=/dev/vda`.
+
+**A guest with no clock hands out timestamps its clients parse.** Without an
+RTC the guest starts at the epoch and `docker ps` says a container was created
+56 years ago. There is a PL031 in the device tree now — the guest's AMBA bus
+reads its identity registers, which is the check — but a stock kernel's driver
+for it is a module that is not always installed, so the VMM also puts the time
+on the kernel command line, where an unrecognised `key=value` reaches init as
+an environment variable. Both numbers come from the same call, so they cannot
+disagree.
+
 ## What is next
 
-**Something worth talking to.** Both directions of vsock work, so the remaining
-step is what runs inside: a root filesystem carrying a container daemon, with
-the host's client reaching it through the inward path. That is integration
-rather than a new device.
+**Ports, and more than one thing at a time.** Every inward connection goes to
+one guest port, there are eight streams, and there is no port mapping, so a
+container that listens is not reachable from the host. `docker compose up` is
+the next real user.
 
 The language change this project expected never arrived. `Raw`, Mere's window
 type for physical memory, was going to need a second source so that a virtio

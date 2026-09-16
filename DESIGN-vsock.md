@@ -169,6 +169,33 @@ userspace: vsock_server exit 0: listening on port 1024 / served 19 bytes / serve
 | take the host program away | `connect()` must fail rather than hang — a device that accepts the connection and leaves the guest waiting would look like "no reply", which a weaker check would call a pass |
 | remove the wake-up thread | the stream still opens and the guest still writes; the reply never arrives. This is the bug that actually happened — **twice**, once in each direction, because the thread was started by an event rather than by the device coming up |
 | start the inward handshake from the wrong end (answer `RESPONSE` instead of asking `REQUEST`) | the host still reaches the VMM and a stream is still allocated; the guest never accepts. This is the mistake "the same code with the arguments swapped" would make |
+| treat a half-close as the end of the stream (`SHUTDOWN` with `3`) | `docker load` and `docker logs` stay green; `docker run` prints nothing, while the daemon's log says it framed the bytes. In `test/stack.sh`, because it takes a real client to close one side and keep reading the other |
+
+## End of file is not the end of the stream
+
+The longest-lived bug in this device, and the one that only a real client
+found. `read()` on the host end returning 0 means **the peer will send no
+more**. It does not mean the connection is over: a client that closes its write
+side is still waiting to read the answer, and `docker run` does exactly that on
+the connection it attaches with.
+
+The first version answered that by telling the guest `SHUTDOWN` with **both**
+flags set, and by closing the host socket. Both halves were wrong:
+
+- flags `3` says "this end will neither send nor receive", which shuts down the
+  **guest's write side** — the direction that still had the answer in it;
+- closing the socket takes the write direction with it, so even a correct
+  SHUTDOWN would have had nowhere to go.
+
+It now sends `F_SEND` alone (`2`) and **mutes** the socket rather than closing
+it: the fd stops being polled for reading, because an fd at end of file stays
+readable forever and a poll that still watched it would spin.
+
+The witness was an attach stream that carried its 101 response header — 117
+bytes — and nothing after it, while the daemon's own log said it had framed 26
+bytes of the container's output. `docker logs` was green the whole time,
+because that is a separate connection that nobody half-closes. `test/stack.sh`
+poisons it by putting the `3` back.
 
 ## A truncated initramfs is not an error
 

@@ -1,0 +1,36 @@
+#!/bin/sh
+# initrd/init-mengd — a container daemon inside the VM.
+#
+# This is the whole stack in one guest: mengd answering the Docker Engine API
+# on a vsock port, with mrun as its runtime. The host's own `docker` client
+# reaches it through a unix socket on the host that the VMM carries in.
+mkdir -p /dev || exit 21
+mount -t devtmpfs dev /dev || exit 22
+mkdir -p /proc /sys 2>/dev/null
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+say() { echo "userspace: $1" > /dev/kmsg; }
+say "init-mengd starting"
+
+for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
+  insmod /opt/$m.ko 2>/dev/null || say "insmod $m FAILED"
+done
+say "vsock modules loaded"
+
+mkdir -p /var/lib/mengd /usr/local/bin /tmp
+cp /opt/mrun /usr/local/bin/mrun && chmod 755 /usr/local/bin/mrun
+say "mrun is at $(command -v mrun || echo /usr/local/bin/mrun)"
+
+# Everything mengd says goes to the kernel log, which is the only console here.
+MENGD_TRACE=1 /opt/mengd vsock://1024 /var/lib/mengd /usr/local/bin/mrun 2>&1 | \
+  while read -r l; do echo "mengd: $l" > /dev/kmsg; done &
+say "mengd started on vsock port 1024"
+
+# A bounded life. The host does its work in the first seconds; powering down on
+# a clock rather than being killed is what lets the run end cleanly and the
+# console be complete when it is read.
+i=0
+while [ "$i" -lt "${MENGD_SECONDS:-180}" ]; do sleep 1; i=$((i+1)); done
+say "init-mengd done"
+poweroff -f
+exit 99

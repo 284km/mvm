@@ -330,6 +330,13 @@ int hv_start_deadline(int ms) {
 }
 int hv_deadline_fired(void) { return DEADLINE_FIRED; }
 
+/* Seconds since the epoch, for the guest's clock.
+ *
+ * Seconds rather than milliseconds because the FFI boundary's int is C's int:
+ * 32 bits. Seconds fit until 2038 and milliseconds do not fit at all, and an
+ * RTC that silently wrapped would be worse than none. */
+int hv_now_secs(void) { return (int)time(NULL); }
+
 /* ---- vsock's host end ----------------------------------------------------
  *
  * A vsock stream has two halves. The guest's is a virtio queue; the host's is
@@ -344,12 +351,16 @@ int hv_deadline_fired(void) { return DEADLINE_FIRED; }
  */
 #define VS_MAX 8
 static int VS_FD[VS_MAX];
+/* "The peer will send no more." Not the same as "the connection is over":
+ * a host program that closes its write side is still waiting to READ, and
+ * closing the socket because read() returned 0 throws away the answer. */
+static int VS_MUTE[VS_MAX];
 static int VS_INIT;
 static int VS_LISTEN_FD = -1;
 
 static void vs_init(void) {
     if (VS_INIT) return;
-    for (int i = 0; i < VS_MAX; i++) VS_FD[i] = -1;
+    for (int i = 0; i < VS_MAX; i++) { VS_FD[i] = -1; VS_MUTE[i] = 0; }
     VS_INIT = 1;
 }
 static int vs_ok(int h) { vs_init(); return h >= 0 && h < VS_MAX && VS_FD[h] >= 0; }
@@ -411,13 +422,22 @@ int hv_vs_accept(void) {
     if (fd < 0) return -1;
     int fl = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    VS_FD[h] = fd;
+    VS_FD[h] = fd; VS_MUTE[h] = 0;
     return h;
+}
+
+/* Stop reading from this end without closing it. An fd at end of file stays
+ * readable forever, so a poll that still watched it would spin, and a close
+ * would take the write direction with it. */
+int hv_vs_mute(int h) {
+    if (!vs_ok(h)) return -1;
+    VS_MUTE[h] = 1;
+    return 0;
 }
 
 int hv_vs_close(int h) {
     if (!vs_ok(h)) return -1;
-    close(VS_FD[h]); VS_FD[h] = -1; return 0;
+    close(VS_FD[h]); VS_FD[h] = -1; VS_MUTE[h] = 0; return 0;
 }
 
 /* Guest RAM -> the host socket. All of it, or -1. */
@@ -455,7 +475,7 @@ int hv_vs_recv(int h, const char *gpa_hex, int max) {
 
 /* Is there anything to read? Asked on every WFI, so it may not block. */
 int hv_vs_ready(int h) {
-    if (!vs_ok(h)) return 0;
+    if (!vs_ok(h) || VS_MUTE[h]) return 0;
     struct pollfd pf; pf.fd = VS_FD[h]; pf.events = POLLIN; pf.revents = 0;
     if (poll(&pf, 1, 0) <= 0) return 0;
     return (pf.revents & (POLLIN | POLLHUP)) ? 1 : 0;
@@ -484,7 +504,7 @@ static void *vs_watch_thread(void *arg) {
             pf[n].fd = VS_LISTEN_FD; pf[n].events = POLLIN; pf[n].revents = 0; n++;
         }
         for (int i = 0; i < VS_MAX; i++)
-            if (VS_FD[i] >= 0) { pf[n].fd = VS_FD[i]; pf[n].events = POLLIN; pf[n].revents = 0; n++; }
+            if (VS_FD[i] >= 0 && !VS_MUTE[i]) { pf[n].fd = VS_FD[i]; pf[n].events = POLLIN; pf[n].revents = 0; n++; }
         if (n == 0) {
             struct timespec ts = { 0, 5 * 1000 * 1000L }; nanosleep(&ts, NULL);
             continue;

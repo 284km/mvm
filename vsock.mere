@@ -38,6 +38,7 @@ extern fn hv_vs_close: int -> int;
 extern fn hv_vs_send: int -> str -> int -> int;
 extern fn hv_vs_recv: int -> str -> int -> int;
 extern fn hv_vs_ready: int -> int;
+extern fn hv_vs_mute: int -> int;
 extern fn hv_vs_wake: unit -> int;
 
 let vs_base = 0xa000200;
@@ -129,6 +130,10 @@ let vs_alloc = fn (s) ->
 
 let vs_release = fn (s) -> fn (i: int) ->
   let h = sget s i s_handle in
+  let _ = if vs_tracing () then
+            print_err ("mvm: vsock released host port " ++ show (sget s i s_hport)
+                    ++ " (guest took " ++ show (sget s i s_fwd) ++ " bytes, was given "
+                    ++ show (sget s i s_sent) ++ ")") else () in
   let _ = if h >= 0 then (let _ = hv_vs_close h in ()) else () in
   let _ = sset s i s_handle (0 - 1) in
   let _ = sset s i s_st st_free in
@@ -242,14 +247,24 @@ let vs_pump_one = fn (s) -> fn (i: int) ->
             let _ = vs_rx_done s head (vs_hdr + n) in
             n
           else if n == 0 - 2 then
-            // End of file on the host end. The guest is told so with a
-            // SHUTDOWN in both directions, which is what makes its read()
-            // return 0 instead of waiting on a stream nobody will ever fill.
+            // End of file on the host end means "the peer will send no more".
+            // It does NOT mean the stream is over: a client that closes its
+            // write side is still waiting to read the answer, and `docker run`
+            // does exactly that on the connection it attaches with.
+            //
+            // So SHUTDOWN carries F_SEND alone (2), not both directions (3).
+            // Sending 3 tells the guest this end will not RECEIVE either,
+            // which shuts down the guest's write side -- and the answer it was
+            // about to write is then never sent. The witness was an attach
+            // stream that carried its 101 header and nothing after it, while
+            // the daemon's own log said it had framed 26 bytes of output.
+            //
+            // The socket stays open, muted rather than closed, because closing
+            // it would take the write direction with it.
             let _ = vs_put_hdr a (sget s i s_hport) (sget s i s_gport)
-                                 0 op_shutdown 3 (sget s i s_fwd) in
+                                 0 op_shutdown 2 (sget s i s_fwd) in
             let _ = vs_rx_done s head vs_hdr in
-            let _ = hv_vs_close h in
-            let _ = sset s i s_handle (0 - 1) in
+            let _ = hv_vs_mute h in
             0 - 2
           else 0;
 
@@ -383,6 +398,9 @@ let vs_tx_one = fn (s) -> fn (path: str) -> fn (head: int) ->
        else if pa == 0 then 0
        else
          let n = hv_vs_send (sget s i s_handle) (hexs pa) plen in
+         let _ = if vs_tracing () then
+                   print_err ("mvm: vsock guest->host " ++ show plen ++ " bytes on host port "
+                           ++ show (sget s i s_hport) ++ " -> " ++ show n) else () in
          if n < 0 then
            let _ = print_err "mvm: vsock host write failed" in
            let _ = vs_ctl s i op_rst 0 in
