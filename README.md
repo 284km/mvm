@@ -353,6 +353,19 @@ whole difference between this and letting something on this side terminate TLS
 on the guest's behalf. It binds the loopback, because what is on the other end
 is a virtual machine asking to reach the internet.
 
+A build's steps use it too — `docker build` with `RUN apk add` installs from
+the package mirror, inside a machine with no network interface at all:
+
+```
+mproxy: registry-1.docker.io:443
+mproxy: production.cloudfront.docker.com:443
+mproxy: dl-cdn.alpinelinux.org:443
+```
+
+**A client has to speak `CONNECT`.** One that sends `GET http://host/path` is
+asking this to fetch on its behalf, which is a different thing — and for
+`https` it would mean this end doing the TLS. It is refused, and told why.
+
 `test/hub.sh` is the check, and it needs the internet — it **fails rather than
 skips** without it. Its oracle is not this stack: the config digest of the
 arm64 manifest out of what `docker` downloaded for the same reference.

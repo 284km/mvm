@@ -28,7 +28,9 @@ IMAGE_FILE="${IMAGE_FILE:-$out/Image}"
 VSMOD="${VSMOD:-$out/extra}"
 [ -r "$VSMOD/vsock.ko" ] || { echo "no vsock modules in $VSMOD -- see test/vsock.sh" >&2; exit 2; }
 IMG="${IMG:-gcc:14}"
-SECS="${SECS:-180}"
+# A build that installs a package takes a while, and the guest's own clock is
+# what ends the run.
+SECS="${SECS:-420}"
 REF="${REF:-docker.io/library/alpine:latest}"
 fail=0
 say() { [ "$1" = 0 ] && echo "  ok    $2" || { echo "  FAIL  $2"; fail=1; }; }
@@ -69,7 +71,7 @@ chmod 755 "$out/extra-hub/mengd" "$out/extra-hub/mrun" "$out/extra-hub/mfwd"
 [ -x "$out/extra-hub/mengd" ] && [ -x "$out/mproxy" ]; say $? "everything builds, with TLS"
 
 echo "== the machine =="
-"$out/mproxy" 3128 > "$out/mproxy.log" 2>&1 &
+MPROXY_TRACE=1 "$out/mproxy" 3128 > "$out/mproxy.log" 2>&1 &
 PXPID=$!
 sleep 1
 curl -s -x http://127.0.0.1:3128 -o /dev/null -m 20 -w '%{http_code}' https://registry-1.docker.io/v2/ | grep -q 401
@@ -124,6 +126,32 @@ want=$(python3 "$out/config_digest.py" "$out/hub-oracle.tar" 2>/dev/null)
 mine=$(d images --format '{{.ID}}' 2>/dev/null | head -1)
 [ -n "$want" ] && [ "$want" = "$mine" ]
 say $? "the image id is the config digest docker downloaded for it ($mine vs $want)"
+
+echo "== a build whose steps need the network =="
+# The daemon reaching a registry and a CONTAINER reaching a package mirror are
+# different paths: one is the daemon's own socket, the other is a tool inside a
+# container in a machine with no network. This is the second.
+mkdir -p "$out/nctx"
+cat > "$out/nctx/Dockerfile" <<'DF'
+FROM docker.io/library/alpine:latest
+RUN apk add --no-cache curl && echo apk-ok
+RUN curl -sS -o /got.txt https://example.com/ && echo curl-ok
+CMD ["head", "-1", "/got.txt"]
+DF
+( cd "$out/nctx" && DOCKER_BUILDKIT=0 DOCKER_HOST= docker -H "unix://$SOCK" build -t netbuild:v1 .     > "$out/netbuild.log" 2>&1 )
+say $? "docker build, with steps that install and fetch"
+grep -q "apk-ok" "$out/netbuild.log"; say $? "a package manager reached its mirror"
+grep -q "curl-ok" "$out/netbuild.log"; say $? "and a tool fetched over TLS"
+bo=$(d run --network host netbuild:v1 2>/dev/null | head -1)
+case "$bo" in *"Example Domain"*) echo "  ok    and the image it built has what it fetched";;                *) echo "  FAIL  the built image printed: $bo"; fail=1;; esac
+grep -q "mproxy: dl-cdn.alpinelinux.org:443" "$out/mproxy.log"
+say $? "the package mirror was reached through the proxy, not some other way"
+
+# What the proxy will NOT do, and says so. busybox's wget has no CONNECT: it
+# asks the proxy to fetch, which for https would mean this end doing the TLS
+# and the caller verifying nothing.
+wo=$(curl -s -x http://127.0.0.1:3128 http://example.com/ 2>&1 | head -1)
+case "$wo" in *"does not fetch on your behalf"*) echo "  ok    and a client that asks it to fetch is told why not";;                *) echo "  FAIL  got: $wo"; fail=1;; esac
 
 kill "$VMPID" 2>/dev/null; wait "$VMPID" 2>/dev/null
 kill "$PXPID" 2>/dev/null; wait "$PXPID" 2>/dev/null

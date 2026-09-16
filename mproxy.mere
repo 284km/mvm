@@ -85,7 +85,14 @@ let serve_one = fn (c: int) ->
   let (h, p) = parse_connect line in
   if str_len h == 0 then
     let _ = if tracing () then print_err ("mproxy: refused " ++ line) else () in
-    let _ = px_write c "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n" in
+    // Said, not just refused. A client that sends "GET http://host/path" is
+    // asking this to FETCH on its behalf, which is a different thing from
+    // tunnelling -- and for https it would mean this end doing the TLS, so the
+    // caller would verify nothing. busybox's wget asks exactly that and has no
+    // CONNECT; curl, apk, npm and pip all tunnel.
+    let body = "this proxy tunnels with CONNECT; it does not fetch on your behalf\n" in
+    let _ = px_write c ("HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\n"
+                     ++ "Content-Length: " ++ show (str_len body) ++ "\r\n\r\n" ++ body) in
     let _ = px_close c in ()
   else
     let _ = drain_headers c in
