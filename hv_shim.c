@@ -22,6 +22,7 @@
 #include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
@@ -403,16 +404,52 @@ int hv_vs_connect(const char *path) {
     if (h < 0) return -1;
     int fd;
     if (!strncmp(path, "tcp:", 4)) {
-        int port = atoi(path + 4);
+        /* "tcp:<port>" is this machine's loopback; "tcp:<host>:<port>" is
+         * wherever that name leads. The second exists because the guest has no
+         * resolver and no route: it asks for a vsock port, and the side that
+         * has a network turns that into a name and a connection. */
+        const char *rest = path + 4;
+        const char *colon = strrchr(rest, ':');
+        char host[256];
+        int port;
+        if (colon) {
+            size_t n = (size_t)(colon - rest);
+            if (n == 0 || n >= sizeof host) return -4;
+            memcpy(host, rest, n);
+            host[n] = 0;
+            port = atoi(colon + 1);
+        } else {
+            host[0] = 0;
+            port = atoi(rest);
+        }
         if (port <= 0 || port > 65535) return -4;
-        fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) return -1;
-        struct sockaddr_in in;
-        memset(&in, 0, sizeof in);
-        in.sin_family = AF_INET;
-        in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        in.sin_port = htons((uint16_t)port);
-        if (connect(fd, (struct sockaddr *)&in, sizeof in) != 0) { close(fd); return -1; }
+        if (host[0] == 0) {
+            fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) return -1;
+            struct sockaddr_in in;
+            memset(&in, 0, sizeof in);
+            in.sin_family = AF_INET;
+            in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            in.sin_port = htons((uint16_t)port);
+            if (connect(fd, (struct sockaddr *)&in, sizeof in) != 0) { close(fd); return -1; }
+        } else {
+            char portstr[16];
+            snprintf(portstr, sizeof portstr, "%d", port);
+            struct addrinfo hints, *res = NULL, *ai;
+            memset(&hints, 0, sizeof hints);
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return -5;
+            fd = -1;
+            for (ai = res; ai; ai = ai->ai_next) {
+                fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+                if (fd < 0) continue;
+                if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+                close(fd); fd = -1;
+            }
+            freeaddrinfo(res);
+            if (fd < 0) return -1;
+        }
     } else {
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;

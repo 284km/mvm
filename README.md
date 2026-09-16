@@ -363,11 +363,14 @@ it opens and closes host ports, and who wanted one is the caller's business.
 ports. Two VMs would need the control socket to say which — and that is the
 first thing here that would benefit from a name rather than a number.
 
-**A registry it can reach on its own.** Pulling works against a registry on
-this machine, in the clear or over TLS. Docker Hub needs two more things: token
-authentication, and a route that leads off this machine — the outward table
-reaches the loopback here and nothing further. Those are what stand between
-this and never needing another container runtime to fetch an image.
+**A way out to somewhere the guest cannot name in advance.** An outward route
+now reaches `tcp:<host>:<port>` — this machine resolves the name and connects —
+and that is enough for a registry whose address is known when the VM starts.
+It is not enough for Docker Hub: the daemon can pull from it (mengd's
+`test/hub.sh` does, with the token dance and all), but blobs are redirected to
+a content network whose host nobody knows beforehand, and a static route table
+cannot follow that. What that wants is a proxy on this side, spoken to by
+name — which is a program, not a table.
 
 The language change this project expected never arrived. `Raw`, Mere's window
 type for physical memory, was going to need a second source so that a virtio
