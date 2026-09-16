@@ -441,3 +441,35 @@ disks keep whatever a previous run put in them, and a fixed name made the check
 report that the second machine could see the first one's container — which it
 could, from the run before. And the first version counted images instead of
 naming them, which said the machines were sharing when they were not.
+
+## An application, not a feature
+
+```
+sh test/app.sh          # after test/stack.sh, which builds what it reuses
+```
+
+Every other check here asks whether one thing works. This one asks the question
+the whole project exists to answer: **can somebody put a small application on
+this and use it**, the way they would with the thing it replaces? So it uses
+the pieces together, in the order a person would:
+
+| | |
+|---|---|
+| `compose up --build` | a service built from a Dockerfile in the context |
+| two services | talking to each other by name |
+| a named volume | that survives the container that wrote it |
+| a published port | reached from macOS with `curl` |
+| `docker exec` | to look inside while it runs |
+| `docker cp` | to take something out |
+| `compose down` | and nothing of the project left behind |
+
+None of that was new when it was written. It found **four** defects anyway —
+they are in mengd's README — and every one of them is a feature that works
+alone and breaks in company. That is the shape of check that can see them, and
+the reason this file exists.
+
+Its own two lessons, both about not asserting on machine state: the disk image
+carries whatever earlier runs left in it, so "no containers left" has to mean
+**this project's** containers, and the HTTP server the test builds had to
+compute its own `Content-Length` correctly before the port check meant
+anything.
