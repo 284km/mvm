@@ -411,3 +411,33 @@ queue in the guest's RAM could be read from Mere. It did not: the queue is read
 by copying through the shim, and the measurement said what that costs — 4 KiB
 at 1,659 MB/s once the disk is opened once rather than per request. Nothing in
 this VMM has needed a change to the language.
+
+## Two machines
+
+```
+sh test/two.sh          # after test/stack.sh, which builds what it reuses
+```
+
+Everything here assumed one: one VM, one docker socket, one control socket, one
+set of published ports. The plan expected the second machine to need the
+control socket to say *which* machine it meant — the first place where a number
+is not enough and a name is.
+
+It turned out not to. Every path is already an argument or an environment
+variable, so a second machine is a second set of them. That is worth a **check**
+rather than a claim: "it should work" and "it works" differ exactly there.
+
+What the check judges is that the two are **separate**, because both answering
+is not enough — one VM answering on two sockets would do that:
+
+- a container made in one is not in the other, **by name**
+- each published port reaches **its own** guest
+- killing one leaves the other answering, on its port and on its socket
+
+Poisoned by pointing the second client at the first socket, it fails five ways.
+
+Two things it found about itself. The names have to be **unique per run**: the
+disks keep whatever a previous run put in them, and a fixed name made the check
+report that the second machine could see the first one's container — which it
+could, from the run before. And the first version counted images instead of
+naming them, which said the machines were sharing when they were not.
