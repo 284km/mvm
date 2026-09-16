@@ -26,6 +26,24 @@ for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
 done
 say "vsock modules loaded"
 
+# A network between containers: a bridge, and a veth pair per container. Both
+# are =m in a stock kernel, and bridge wants the spanning-tree and LLC modules
+# under it -- in that order, because insmod resolves nothing for itself.
+#
+# Without these, containers get a namespace with a loopback in it and no way to
+# reach each other, which is a compose file that comes up and does not work.
+for m in llc stp bridge veth; do
+  [ -r /opt/$m.ko ] && { insmod /opt/$m.ko 2>/dev/null || say "insmod $m FAILED"; }
+done
+# What the kernel says it has, not what insmod appeared to do. The daemon
+# cannot make a bridge or a veth pair without these, and "the module is not
+# here" and "the call was refused" look identical from where the daemon sits.
+if [ -d /sys/module/bridge ] && [ -d /sys/module/veth ]; then
+  say "bridge and veth are in the kernel"
+else
+  say "no bridge/veth: containers will have no way to reach each other"
+fi
+
 # overlayfs. A build step's layer IS the upper directory of an overlay mount,
 # so without this the daemon can only write the whole root filesystem as one
 # layer. It is =m in a stock kernel like vsock is.

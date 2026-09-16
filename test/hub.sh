@@ -54,7 +54,7 @@ mkdir -p "$out/extra-hub" "$MENGD_SRC/.build" "$MRUN_SRC/.build"
 "$M" -c "$here/mkdtb.mere"      > "$out/mkdtb.c"              2>"$out/e5" || { echo FAIL mkdtb emit; exit 1; }
 "$M" -c "$here/boot.mere"       > "$out/boot.c"               2>"$out/e6" || { echo FAIL boot emit;  exit 1; }
 docker run --rm -v "$MENGD_SRC:/w" -w /w "$BUILD_IMG" cc -O2 -static -o .build/mengd-linux \
-  .build/mengd.c unix_shim.c fs_shim.c store_shim.c -lssl -lcrypto -lz -lzstd -ldl -lpthread >/dev/null 2>&1
+  .build/mengd.c unix_shim.c fs_shim.c store_shim.c net_shim.c -lssl -lcrypto -lz -lzstd -ldl -lpthread >/dev/null 2>&1
 docker run --rm -v "$MRUN_SRC:/w" -w /w "$IMG" cc -O2 -static -o .build/mrun-linux .build/mrun.c linux_shim.c >/dev/null 2>&1
 docker run --rm -v "$out:/o" -v "$here/guest:/g:ro" -w /o "$IMG" cc -O2 -static -o /o/mfwd-linux /o/mfwd.c /g/fwd_shim.c >/dev/null 2>&1
 cc -O2 -o "$out/mproxy"   "$out/mproxy.c" "$here/proxy_shim.c" 2>/dev/null || { echo FAIL cc mproxy; exit 1; }

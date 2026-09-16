@@ -12,9 +12,10 @@
 # WHAT IT NEEDS:
 #   MERE=<a merelang/mere checkout>   MENGD_SRC=<284km/mengd>   MRUN_SRC=<284km/mrun>
 #   an arm64 Image in .build/, and VSMOD=<dir> with the three vsock modules
-#   plus overlay.ko -- all from THAT kernel, all =m in a stock one. Without
-#   overlay.ko the daemon in the guest can still build images, but it writes
-#   the whole root filesystem as one layer; the boot line it prints says which.
+#   plus overlay.ko, veth.ko, bridge.ko, stp.ko and llc.ko -- all from THAT
+#   kernel, all =m in a stock one. Each one the guest is missing costs a
+#   feature and says so on the console at boot: overlay is one layer per build
+#   step, bridge and veth are containers being able to reach each other.
 #   (see test/vsock.sh for where those come from), and a container runtime.
 set -u
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -60,7 +61,7 @@ mkdir -p "$out/extra-mengd" "$MENGD_SRC/.build" "$MRUN_SRC/.build"
 "$M" -c "$MENGD_SRC/mengd.mere" > "$MENGD_SRC/.build/mengd.c" 2>"$out/e1" || { echo FAIL mengd emit; sed -n 1,8p "$out/e1"; exit 1; }
 "$M" -c "$MRUN_SRC/mrun.mere"   > "$MRUN_SRC/.build/mrun.c"   2>"$out/e2" || { echo FAIL mrun emit;  sed -n 1,8p "$out/e2"; exit 1; }
 docker run --rm -v "$MENGD_SRC:/w" -w /w "$BUILD_IMG" \
-  cc -O2 -static -o .build/mengd-linux .build/mengd.c unix_shim.c fs_shim.c store_shim.c \
+  cc -O2 -static -o .build/mengd-linux .build/mengd.c unix_shim.c fs_shim.c store_shim.c net_shim.c \
      -lssl -lcrypto -lz -lzstd -ldl -lpthread >/dev/null 2>&1
 docker run --rm -v "$MRUN_SRC:/w" -w /w "$IMG" \
   cc -O2 -static -o .build/mrun-linux .build/mrun.c linux_shim.c >/dev/null 2>&1
@@ -173,6 +174,8 @@ say $? "the guest was given the ${want_k}K the VMM mapped"
 # time, so the guest says which at boot and this reads that line.
 grep -qa "] userspace: overlay mounts" "$c"
 say $? "the guest can mount an overlay (a build step's layer is its upper dir)"
+grep -qa "] userspace: bridge and veth are in the kernel" "$c"
+say $? "and has the bridge and veth modules a container network is made of"
 
 export DOCKER_HOST=
 d() { docker -H "unix://$SOCK" "$@"; }
@@ -209,6 +212,26 @@ YAML
 co=$( cd "$out/compose" && DOCKER_HOST= docker -H "unix://$SOCK" compose up 2>&1 )
 echo "$co" | grep -q "hello-from-compose"; say $? "compose creates a network, runs the service and streams its output"
 echo "$co" | grep -q "exited with code 0"; say $? "and reports how it ended"
+
+# TWO services, which is the case a compose file is written for. Inside a VM
+# that has no network interface of its own, two containers reach each other
+# over a bridge this daemon built, by the name the compose file gave them.
+mkdir -p "$out/compose2"
+cat > "$out/compose2/compose.yaml" <<'YAML'
+services:
+  store:
+    image: alpine:latest
+    command: ["sh", "-c", "while true; do echo SERVED | nc -l -p 6379; done"]
+  app:
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 3; (echo probe | nc -w 3 store 6379) || echo CANNOT-REACH-store; sleep 15"]
+YAML
+( cd "$out/compose2" && DOCKER_HOST= docker -H "unix://$SOCK" compose -p two up -d >/dev/null 2>&1 )
+sleep 9
+lg=$( cd "$out/compose2" && DOCKER_HOST= docker -H "unix://$SOCK" compose -p two logs app 2>&1 )
+echo "$lg" | grep -q "SERVED"
+say $? "one service reached the other by name, inside the VM ($(echo "$lg" | grep -o 'SERVED\|CANNOT-REACH-store' | head -1))"
+( cd "$out/compose2" && DOCKER_HOST= docker -H "unix://$SOCK" compose -p two down >/dev/null 2>&1 )
 
 echo "== a published port, reached from the host =="
 # The container listens inside its own network namespace, inside a VM with no
