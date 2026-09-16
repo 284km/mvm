@@ -1,0 +1,372 @@
+import "virtio.mere";
+
+// vsock.mere — virtio-vsock: one stream between the guest and a host socket.
+//
+// WHY THIS DEVICE. The host and the guest have to talk, and the two obvious
+// ways do not work here: virtio-net needs vmnet.framework, whose
+// vmnet_start_interface returns 1001 for a process that is not root, and a
+// shared file is not a stream. vsock is the transport whose whole reason for
+// existing is host-to-guest, it needs no addresses, no DHCP and no bridge, and
+// the guest kernel already has it -- as three modules rather than built in,
+// which is a fact about the initramfs and not about the device.
+//
+// WHAT IT IS. Device id 19 on the same virtio-mmio transport as the block
+// device, at its own window and its own SPI. Three queues -- rx, tx, event --
+// and the guest's end of a stream is a virtqueue while the host's end is an
+// ordinary AF_UNIX socket, so what the guest connects to is a real program.
+//
+// WHAT IT REFUSES. One stream at a time; SEQPACKET is not offered; a second
+// REQUEST while a stream is open is answered RST rather than queued. Those are
+// refusals, not gaps to be filled in silently later: each one is a packet the
+// guest can see, not a case that falls through to zero.
+
+extern fn hv_read_u32: str -> int;
+extern fn hv_write_u32: str -> int -> int;
+extern fn hv_write_u16: str -> int -> int;
+extern fn hv_write_u64: str -> str -> int;
+extern fn hv_spi: int -> int -> int;
+extern fn hv_vs_connect: str -> int;
+extern fn hv_vs_close: int -> int;
+extern fn hv_vs_send: int -> str -> int -> int;
+extern fn hv_vs_recv: int -> str -> int -> int;
+extern fn hv_vs_ready: int -> int;
+extern fn hv_vs_wake_on: int -> int;
+
+let vs_base = 0xa000200;
+let vs_intid = 49;                  // SPI 17 in the device tree, which is 32+17
+let vs_qmax = 64;
+let vs_cid_host = 2;                // fixed by the specification
+let vs_cid_guest = 3;               // the first cid a guest is allowed
+let vs_hdr = 44;                    // src_cid dst_cid src_port dst_port len type op flags buf_alloc fwd_cnt
+let vs_buf_alloc = 262144;          // what this end claims it can hold
+
+let vs_type_stream = 1;
+let op_request = 1; let op_response = 2; let op_rst = 3; let op_shutdown = 4;
+let op_rw = 5; let op_credit_update = 6; let op_credit_request = 7;
+
+// State. Five device-wide slots, then six per queue, because three queues
+// means three descriptor tables and one field cannot hold three addresses.
+let vs_dfsel = 0; let vs_drvfsel = 1; let vs_qsel = 2; let vs_status = 3; let vs_isr = 4;
+let vs_qfirst = 5; let vs_qstride = 6;
+let vs_handle = 23;      // the host socket, or -1
+let vs_gport = 24;       // the guest's port on the open stream
+let vs_hport = 25;       // ours
+let vs_fwd = 26;         // bytes taken from the guest, which is its credit back
+let vs_peer_alloc = 27;  // what the guest says it can hold
+let vs_peer_fwd = 28;    // what the guest says it has taken
+let vs_sent = 29;        // bytes handed to the guest
+let vs_isr_reads = 30;   // how many times the guest has read this device's ISR
+let vs_polls = 31;       // how many times the host end has been asked
+let vs_state_n = 32;
+
+let vs_new = fn (u: unit) ->
+  let v = vec_new () in
+  let rec fill = fn (i: int) ->
+    if i == vs_state_n then () else let _ = vec_push v 0 in fill (i + 1) in
+  let _ = fill 0 in
+  let _ = vec_set v vs_handle (0 - 1) in
+  let _ = vec_set v vs_peer_alloc vs_buf_alloc in
+  v;
+
+// Per-queue fields, by name rather than by arithmetic at each use.
+let q_num = 0; let q_ready = 1; let q_desc = 2; let q_avail = 3; let q_used = 4; let q_last = 5;
+let qf = fn (q: int) -> fn (f: int) -> vs_qfirst + q * vs_qstride + f;
+let qget = fn (s) -> fn (q: int) -> fn (f: int) -> (vec_get s (qf q f) : int);
+let qset = fn (s) -> fn (q: int) -> fn (f: int) -> fn (v: int) -> vec_set s (qf q f) v;
+
+let q_rx = 0; let q_tx = 1; let q_ev = 2;
+
+let vs_tracing = fn (u: unit) ->
+  match env_var "MVM_VSOCK_TRACE" with
+  | Some v -> str_len v > 0
+  | _ -> false;
+
+// ---- packets --------------------------------------------------------------
+
+// The header this end writes. The two cids are 64-bit, which is why they go
+// through hv_write_u64 rather than two halves: an address or an identifier
+// split across two calls is two chances to write one of them and not the other.
+let vs_put_hdr = fn (a: int) -> fn (src_port: int) -> fn (dst_port: int)
+              -> fn (len: int) -> fn (op: int) -> fn (flags: int) -> fn (fwd: int) ->
+  let _ = hv_write_u64 (hexs a) (hexs vs_cid_host) in
+  let _ = hv_write_u64 (hexs (a + 8)) (hexs vs_cid_guest) in
+  let _ = hv_write_u32 (hexs (a + 16)) src_port in
+  let _ = hv_write_u32 (hexs (a + 20)) dst_port in
+  let _ = hv_write_u32 (hexs (a + 24)) len in
+  let _ = hv_write_u16 (hexs (a + 28)) vs_type_stream in
+  let _ = hv_write_u16 (hexs (a + 30)) op in
+  let _ = hv_write_u32 (hexs (a + 32)) flags in
+  let _ = hv_write_u32 (hexs (a + 36)) vs_buf_alloc in
+  let _ = hv_write_u32 (hexs (a + 40)) fwd in
+  0;
+
+// One buffer off the rx available ring, or -1 when the guest has posted none.
+// Not taking one is the normal case and not an error: it means the guest is
+// not ready to be told anything yet, and the packet has to wait.
+let vs_rx_take = fn (s) ->
+  let qn = qget s q_rx q_num in
+  let av = qget s q_rx q_avail in
+  if qn == 0 then 0 - 1
+  else
+    let aidx = hv_read_u16 (hexs (av + 2)) in
+    let last = qget s q_rx q_last in
+    if last == aidx then 0 - 1
+    else hv_read_u16 (hexs (av + 4 + (last % qn) * 2));
+
+let vs_rx_done = fn (s) -> fn (head: int) -> fn (len: int) ->
+  let qn = qget s q_rx q_num in
+  let us = qget s q_rx q_used in
+  let uidx = hv_read_u16 (hexs (us + 2)) in
+  let _ = hv_write_u32 (hexs (us + 4 + (uidx % qn) * 8)) head in
+  let _ = hv_write_u32 (hexs (us + 4 + (uidx % qn) * 8 + 4)) len in
+  let _ = hv_write_u16 (hexs (us + 2)) (bit_and (uidx + 1) 65535) in
+  let _ = qset s q_rx q_last (bit_and (qget s q_rx q_last + 1) 65535) in
+  let _ = vec_set s vs_isr 1 in
+  let _ = hv_spi vs_intid 1 in
+  0;
+
+// A packet with no payload: RESPONSE, RST, SHUTDOWN, CREDIT_UPDATE.
+let vs_ctl = fn (s) -> fn (op: int) -> fn (flags: int) ->
+  let head = vs_rx_take s in
+  if head < 0 then
+    // Named, not swallowed. "The guest posted no receive buffer" and "the
+    // packet was sent and lost" look identical from the guest -- it waits --
+    // and only this end can tell them apart.
+    let _ = print_err ("mvm: vsock could not send op " ++ show op
+                    ++ ": no rx buffer (qnum " ++ show (qget s q_rx q_num)
+                    ++ " avail " ++ show (qget s q_rx q_avail)
+                    ++ " ready " ++ show (qget s q_rx q_ready) ++ ")") in
+    0 - 1
+  else
+    let tbl = qget s q_rx q_desc in
+    let a = d_addr tbl head in
+    let l = d_len tbl head in
+    if l < vs_hdr then
+      let _ = print_err ("mvm: vsock rx buffer is " ++ show l ++ " bytes, shorter than a header") in 0 - 1
+    else
+      let _ = vs_put_hdr a (vec_get s vs_hport : int) (vec_get s vs_gport : int)
+                           0 op flags (vec_get s vs_fwd : int) in
+      let _ = if vs_tracing () then
+                print_err ("mvm: vsock sent op " ++ show op ++ " into desc " ++ show head
+                        ++ " at " ++ hexs a ++ " len " ++ show l
+                        ++ " (rx tbl " ++ hexs tbl ++ " used " ++ hexs (qget s q_rx q_used)
+                        ++ " uidx " ++ show (hv_read_u16 (hexs (qget s q_rx q_used + 2)))
+                        ++ ") isr reads so far " ++ show (vec_get s vs_isr_reads : int))
+              else () in
+      let _ = vs_rx_done s head vs_hdr in
+      0;
+
+// Whatever the host has said, up to one buffer's worth and up to the credit
+// the guest has advertised. Returns the number of payload bytes, 0 for "the
+// host has nothing to say yet", or -2 when the host end has closed.
+let vs_pump_one = fn (s) ->
+  let h = (vec_get s vs_handle : int) in
+  let _ = vec_set s vs_polls ((vec_get s vs_polls : int) + 1) in
+  if h < 0 then 0
+  else if hv_vs_ready h == 0 then 0
+  else
+    let head = vs_rx_take s in
+    let _ = if vs_tracing () then
+              print_err ("mvm: vsock pump: host ready, rx head " ++ show head
+                      ++ " peer_alloc " ++ show (vec_get s vs_peer_alloc : int)
+                      ++ " sent " ++ show (vec_get s vs_sent : int)
+                      ++ " peer_fwd " ++ show (vec_get s vs_peer_fwd : int))
+            else () in
+    if head < 0 then 0
+    else
+      let tbl = qget s q_rx q_desc in
+      let a = d_addr tbl head in
+      let l = d_len tbl head in
+      if l <= vs_hdr then 0
+      else
+        // What the guest has room for: what it said it can hold, less what it
+        // has been sent and not yet taken. Ignoring this is how a device
+        // overruns a driver that was telling it not to.
+        let room = (vec_get s vs_peer_alloc : int)
+                 - ((vec_get s vs_sent : int) - (vec_get s vs_peer_fwd : int)) in
+        let cap = if l - vs_hdr < room then l - vs_hdr else room in
+        if cap <= 0 then 0
+        else
+          let n = hv_vs_recv h (hexs (a + vs_hdr)) cap in
+          if n > 0 then
+            let _ = vs_put_hdr a (vec_get s vs_hport : int) (vec_get s vs_gport : int)
+                                 n op_rw 0 (vec_get s vs_fwd : int) in
+            let _ = vec_set s vs_sent ((vec_get s vs_sent : int) + n) in
+            let _ = vs_rx_done s head (vs_hdr + n) in
+            n
+          else if n == 0 - 2 then
+            // End of file on the host end. The guest is told so with a
+            // SHUTDOWN in both directions, which is what makes its read()
+            // return 0 instead of hanging on a stream nobody will ever fill.
+            let _ = vs_put_hdr a (vec_get s vs_hport : int) (vec_get s vs_gport : int)
+                                 0 op_shutdown 3 (vec_get s vs_fwd : int) in
+            let _ = vs_rx_done s head vs_hdr in
+            let _ = hv_vs_close h in
+            let _ = vec_set s vs_handle (0 - 1) in
+            0 - 2
+          else 0;
+
+// Drain, not one buffer per wake. A reply larger than one receive buffer is
+// the normal case, and handing over one buffer per wake-up makes the stream's
+// speed a property of how often the watching thread happens to poll.
+let vs_pump = fn (s) ->
+  let rec go = fn (total: int) -> fn (guard: int) ->
+    if guard == 0 then total
+    else
+      let n = vs_pump_one s in
+      if n > 0 then go (total + n) (guard - 1) else total in
+  go 0 4096;
+
+// ---- the guest's side of the stream ---------------------------------------
+
+let vs_tx_one = fn (s) -> fn (path: str) -> fn (head: int) ->
+  let tbl = qget s q_tx q_desc in
+  let a0 = d_addr tbl head in
+  let l0 = d_len tbl head in
+  if l0 < vs_hdr then
+    let _ = print_err ("mvm: vsock tx descriptor is " ++ show l0 ++ " bytes, shorter than a header") in 0
+  else
+    let src_port = hv_read_u32 (hexs (a0 + 16)) in
+    let dst_port = hv_read_u32 (hexs (a0 + 20)) in
+    let plen = hv_read_u32 (hexs (a0 + 24)) in
+    let op = hv_read_u16 (hexs (a0 + 30)) in
+    let _ = vec_set s vs_peer_alloc (hv_read_u32 (hexs (a0 + 36))) in
+    let _ = vec_set s vs_peer_fwd (hv_read_u32 (hexs (a0 + 40))) in
+    // The payload is the rest of this descriptor, or the next one in the
+    // chain. Linux sends the header and the data as separate entries; a
+    // driver that inlines them is also legal, so both are read.
+    let has_next = bit_and (d_flags tbl head) vring_desc_f_next != 0 in
+    let pa = if l0 > vs_hdr then a0 + vs_hdr
+             else if has_next then d_addr tbl (d_next tbl head)
+             else 0 in
+    let is_open = (vec_get s vs_handle : int) >= 0 in
+    if op == op_request then
+      (if is_open then
+         // One stream at a time. A second request is refused by name rather
+         // than queued behind the first, because a queue that is not there
+         // cannot be the thing that is tested.
+         let _ = vec_set s vs_gport src_port in
+         let _ = vec_set s vs_hport dst_port in
+         let _ = vs_ctl s op_rst 0 in 0
+       else
+         let h = hv_vs_connect path in
+         let _ = vec_set s vs_gport src_port in
+         let _ = vec_set s vs_hport dst_port in
+         let _ = vec_set s vs_fwd 0 in
+         let _ = vec_set s vs_sent 0 in
+         if h < 0 then
+           let _ = print_err ("mvm: vsock port " ++ show dst_port ++ ": nothing listening at " ++ path) in
+           let _ = vs_ctl s op_rst 0 in 0
+         else
+           let _ = vec_set s vs_handle h in
+           // From here the host may speak at any time, and the vCPU is the
+           // thread that would have to notice. It cannot: it is inside run().
+           let _ = hv_vs_wake_on h in
+           let _ = print_err ("mvm: vsock stream open, guest port "
+                           ++ show (bit_and src_port 0xffffffff)
+                           ++ " to port " ++ show dst_port) in
+           let _ = vs_ctl s op_response 0 in 0)
+    else if op == op_rw then
+      (if is_open == false then let _ = vs_ctl s op_rst 0 in 0
+       else if pa == 0 then 0
+       else
+         let n = hv_vs_send (vec_get s vs_handle : int) (hexs pa) plen in
+         if n < 0 then
+           let _ = print_err "mvm: vsock host write failed" in
+           let _ = vs_ctl s op_rst 0 in 0
+         else
+           // Credit back. The guest stops sending when it thinks this end is
+           // full, so the count of what has been taken has to keep moving.
+           let _ = vec_set s vs_fwd ((vec_get s vs_fwd : int) + n) in
+           let _ = vs_ctl s op_credit_update 0 in 0)
+    else if op == op_credit_request then let _ = vs_ctl s op_credit_update 0 in 0
+    else if op == op_shutdown then
+      (let _ = if is_open then (let _ = hv_vs_close (vec_get s vs_handle : int) in ()) else () in
+       let _ = vec_set s vs_handle (0 - 1) in
+       let _ = vs_ctl s op_rst 0 in 0)
+    else if op == op_rst then
+      (let _ = if is_open then (let _ = hv_vs_close (vec_get s vs_handle : int) in ()) else () in
+       let _ = vec_set s vs_handle (0 - 1) in 0)
+    else if op == op_response then 0
+    else if op == op_credit_update then 0
+    else
+      let _ = print_err ("mvm: vsock refused op " ++ show op) in
+      let _ = vs_ctl s op_rst 0 in 0;
+
+// A queue the guest has notified. tx is where the work is; rx and event are
+// buffers being posted, and posting is not something to consume.
+let vs_notify = fn (s) -> fn (path: str) -> fn (q: int) ->
+  if q != q_tx then let _ = vs_pump s in 0
+  else
+    let qn = qget s q_tx q_num in
+    let av = qget s q_tx q_avail in
+    let us = qget s q_tx q_used in
+    if qn == 0 then 0
+    else
+      let aidx = hv_read_u16 (hexs (av + 2)) in
+      let rec go = fn (last: int) -> fn (n: int) ->
+        if last == aidx then n
+        else
+          let head = hv_read_u16 (hexs (av + 4 + (last % qn) * 2)) in
+          let _ = vs_tx_one s path head in
+          let uidx = hv_read_u16 (hexs (us + 2)) in
+          let _ = hv_write_u32 (hexs (us + 4 + (uidx % qn) * 8)) head in
+          let _ = hv_write_u32 (hexs (us + 4 + (uidx % qn) * 8 + 4)) 0 in
+          let _ = hv_write_u16 (hexs (us + 2)) (bit_and (uidx + 1) 65535) in
+          go (bit_and (last + 1) 65535) (n + 1) in
+      let done = go (qget s q_tx q_last) 0 in
+      let _ = qset s q_tx q_last aidx in
+      let _ = if done > 0 then
+                (let _ = vec_set s vs_isr 1 in let _ = hv_spi vs_intid 1 in ())
+              else () in
+      // The guest sent something, so the host may already have answered.
+      let _ = vs_pump s in
+      done;
+
+// ---- the transport registers ----------------------------------------------
+
+let vs_read = fn (s) -> fn (off: int) ->
+  if off == 0x000 then 0x74726976                 // "virt"
+  else if off == 0x004 then 2                     // version 2
+  else if off == 0x008 then 19                    // vsock
+  else if off == 0x00c then 0x4d455245             // "MERE"
+  else if off == 0x010 then
+    // VIRTIO_F_VERSION_1 and nothing else. Not offering SEQPACKET is what
+    // keeps a second framing out of a device that implements one.
+    (if (vec_get s vs_dfsel : int) == 1 then 1 else 0)
+  else if off == 0x034 then vs_qmax
+  else if off == 0x044 then qget s (vec_get s vs_qsel : int) q_ready
+  else if off == 0x060 then
+    let _ = vec_set s vs_isr_reads ((vec_get s vs_isr_reads : int) + 1) in
+    (vec_get s vs_isr : int)
+  else if off == 0x070 then (vec_get s vs_status : int)
+  else if off == 0x0fc then 0
+  else if off == 0x100 then vs_cid_guest          // guest_cid, low word
+  else if off == 0x104 then 0                     // and high
+  else 0;
+
+let vs_pumps = fn (s) -> (vec_get s vs_polls : int);
+
+let vs_write = fn (s) -> fn (path: str) -> fn (off: int) -> fn (v: int) ->
+  let q = (vec_get s vs_qsel : int) in
+  let inq = q >= 0 && q < 3 in
+  if off == 0x014 then let _ = vec_set s vs_dfsel v in 0
+  else if off == 0x024 then let _ = vec_set s vs_drvfsel v in 0
+  else if off == 0x030 then
+    (if v >= 0 && v < 3 then let _ = vec_set s vs_qsel v in 0
+     else let _ = print_err ("mvm: vsock refused queue " ++ show v) in 0)
+  else if off == 0x038 then (if inq then let _ = qset s q q_num v in 0 else 0)
+  else if off == 0x044 then (if inq then let _ = qset s q q_ready v in 0 else 0)
+  else if off == 0x050 then vs_notify s path v
+  else if off == 0x064 then
+    let _ = vec_set s vs_isr (bit_and (vec_get s vs_isr : int) (bit_not v)) in
+    let _ = if (vec_get s vs_isr : int) == 0 then hv_spi vs_intid 0 else 0 in
+    0
+  else if off == 0x070 then let _ = vec_set s vs_status v in 0
+  else if off == 0x080 then (if inq then let _ = qset s q q_desc (bit_or (bit_and (qget s q q_desc) (bit_shl 0xffffffff 32)) v) in 0 else 0)
+  else if off == 0x084 then (if inq then let _ = qset s q q_desc (bit_or (bit_and (qget s q q_desc) 0xffffffff) (bit_shl v 32)) in 0 else 0)
+  else if off == 0x090 then (if inq then let _ = qset s q q_avail (bit_or (bit_and (qget s q q_avail) (bit_shl 0xffffffff 32)) v) in 0 else 0)
+  else if off == 0x094 then (if inq then let _ = qset s q q_avail (bit_or (bit_and (qget s q q_avail) 0xffffffff) (bit_shl v 32)) in 0 else 0)
+  else if off == 0x0a0 then (if inq then let _ = qset s q q_used (bit_or (bit_and (qget s q q_used) (bit_shl 0xffffffff 32)) v) in 0 else 0)
+  else if off == 0x0a4 then (if inq then let _ = qset s q q_used (bit_or (bit_and (qget s q q_used) 0xffffffff) (bit_shl v 32)) in 0 else 0)
+  else 0;

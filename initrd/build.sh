@@ -10,6 +10,11 @@ set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 out="${1:-$here/../.build/initrd.gz}"
 IMAGE="${IMAGE:-alpine:latest}"
+# INIT picks which init script goes in, EXTRA a directory copied to /opt. The
+# vsock check needs kernel modules and a compiled client, neither of which
+# belongs in the archive every other test boots.
+INIT="${INIT:-$here/init}"
+EXTRA="${EXTRA:-}"
 # The work directory has to be somewhere the container runtime can bind-mount
 # FROM. On macOS `mktemp -d` gives /var/folders/..., which colima does not
 # mount, and a bind mount of an unmounted path is not an error -- the container
@@ -21,7 +26,14 @@ trap 'rm -rf "$work"' EXIT
 cid=$(docker create "$IMAGE" true) || { echo "docker create failed" >&2; exit 1; }
 docker export "$cid" | tar x -C "$work"
 docker rm -f "$cid" >/dev/null
-cp "$here/init" "$work/init"; chmod 755 "$work/init"
+cp "$INIT" "$work/init"; chmod 755 "$work/init"
+if [ -n "$EXTRA" ]; then
+  [ -d "$EXTRA" ] || { echo "initrd/build.sh: EXTRA=$EXTRA is not a directory" >&2; exit 1; }
+  mkdir -p "$work/opt"; cp -R "$EXTRA"/. "$work/opt/"
+  n=$(ls -1 "$work/opt" | wc -l | tr -d ' ')
+  [ "$n" -gt 0 ] || { echo "initrd/build.sh: EXTRA copied nothing" >&2; exit 1; }
+  echo "initrd/build.sh: $n extra entries in /opt"
+fi
 docker run --rm -v "$work:/src:ro" -v "$(cd "$(dirname "$out")" && pwd):/out" "$IMAGE" sh -c \
   'apk add --no-cache cpio >/dev/null 2>&1; cd /src && find . | cpio -o -H newc 2>/dev/null | gzip -9 > /out/'"$(basename "$out")"
 # An archive that small is an empty one, whatever the exit status said.

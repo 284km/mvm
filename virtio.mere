@@ -65,10 +65,18 @@ let g64 = fn (a: int) -> hexv (hv_read_u64 (hexs a));
 // Split virtqueue: a table of 16-byte descriptors, an available ring the
 // driver writes, and a used ring the device writes.
 
-let desc_addr = fn (s) -> fn (i: int) -> g64 ((vec_get s st_desc : int) + i * 16);
-let desc_len  = fn (s) -> fn (i: int) -> g32 ((vec_get s st_desc : int) + i * 16 + 8);
-let desc_flags= fn (s) -> fn (i: int) -> g16 ((vec_get s st_desc : int) + i * 16 + 12);
-let desc_next = fn (s) -> fn (i: int) -> g16 ((vec_get s st_desc : int) + i * 16 + 14);
+// Taken from the table's address rather than from a device's state, because
+// a device with more than one queue has more than one table and the field that
+// held "the" descriptor address cannot answer for both.
+let d_addr  = fn (tbl: int) -> fn (i: int) -> g64 (tbl + i * 16);
+let d_len   = fn (tbl: int) -> fn (i: int) -> g32 (tbl + i * 16 + 8);
+let d_flags = fn (tbl: int) -> fn (i: int) -> g16 (tbl + i * 16 + 12);
+let d_next  = fn (tbl: int) -> fn (i: int) -> g16 (tbl + i * 16 + 14);
+
+let desc_addr = fn (s) -> fn (i: int) -> d_addr (vec_get s st_desc : int) i;
+let desc_len  = fn (s) -> fn (i: int) -> d_len  (vec_get s st_desc : int) i;
+let desc_flags= fn (s) -> fn (i: int) -> d_flags (vec_get s st_desc : int) i;
+let desc_next = fn (s) -> fn (i: int) -> d_next (vec_get s st_desc : int) i;
 
 let vring_desc_f_next = 1;
 let vring_desc_f_write = 2;

@@ -27,6 +27,21 @@ userspace: wrote a file back
 
 and the host finds those bytes in the image afterwards.
 
+It has a **virtio-vsock device**, so a program in the guest holds a conversation
+with a program on the host — the guest's end is a virtqueue, the host's end is
+an ordinary unix socket:
+
+```
+[    0.227002] userspace: vsock_client exit 0: got 39 bytes: host saw 20 bytes: HELLO FROM THE GUEST
+[    0.235926] userspace: vsock_bulk exit 0: bulk ok 65536 bytes each way
+mvm: vsock stream open, guest port 598999410 to port 1234
+```
+
+The host's reply is *derived* from what arrived rather than echoed, because an
+echo cannot tell "the bytes made the round trip" apart from "the guest is
+looking at its own transmit buffer". 128 KiB crosses in 8.9 ms by the guest's
+own clock, every byte checked by value at both ends.
+
 ```
 [    0.000000] Booting Linux on physical CPU 0x0000000000 [0x610f0000]
 [    0.000000] Machine model: linux,dummy-virt
@@ -40,6 +55,7 @@ mvm: guest called PSCI SYSTEM_RESET
 
 ```sh
 sh initrd/build.sh   # an initramfs from a container image, with the init below
+sh test/vsock.sh     # the guest and a host program hold a conversation
 sh test/disk.sh      # virtio-blk, judged from both ends
 sh test/init.sh      # userspace runs
 sh test/boot.sh      # the kernel boots and panics for the right reason
@@ -190,20 +206,25 @@ which is honest for a device with no write cache of its own. A request whose
 descriptor chain is not the shape the specification requires is answered
 `VIRTIO_BLK_S_UNSUPP` rather than guessed at. See `DESIGN-virtio.md`.
 
-No network, no console input, no SMP. No network, no console
-input, no SMP: PSCI answers `NOT_SUPPORTED` to everything except the two calls
-that end the machine. System registers this VMM does not emulate read as zero
+No network and no SMP, and no console input: PSCI answers `NOT_SUPPORTED` to
+everything except the two calls that end the machine. There *is* a way out of
+the VM — virtio-vsock, whose host end is a unix socket — but only outward: a
+server inside the guest is not reachable from the host yet. See
+`DESIGN-vsock.md`. System registers this VMM does not emulate read as zero
 and drop writes, which is what every VMM does with the debug and trace
 registers a kernel touches on the way up, and is also a place where a guest
 could be quietly misled.
 
 ## What is next
 
-**virtio-blk**, so there is a root filesystem and the boot gets past the panic
-to an init process. That is the step where guest memory has to be read from
-Mere rather than through the shim — a virtio queue is descriptors in the
-guest's RAM — and it is the first thing in this whole project that wants a
-language change: `Raw`, Mere's window type for physical memory, has exactly one
-source today, the argument `mere -rv --bare` hands a bare-metal program. Giving
-it a second one is a change to what the language guarantees, so it gets designed
-before it gets written.
+**Connections the other way.** Today the guest connects out and the host
+listens. A container daemon running *inside* the guest needs the opposite: the
+host connects in, to a port the guest is listening on. That is the same device
+and the same queues with the state machine started from the other end.
+
+The language change this project expected never arrived. `Raw`, Mere's window
+type for physical memory, was going to need a second source so that a virtio
+queue in the guest's RAM could be read from Mere. It did not: the queue is read
+by copying through the shim, and the measurement said what that costs — 4 KiB
+at 1,659 MB/s once the disk is opened once rather than per request. Nothing in
+this VMM has needed a change to the language.

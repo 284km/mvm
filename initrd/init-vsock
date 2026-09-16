@@ -1,0 +1,44 @@
+#!/bin/sh
+# initrd/init-vsock — the guest half of the vsock check.
+#
+# vsock is three modules in this kernel, not built in, so the first question is
+# whether they load at all; the second is whether a virtio-vsock device is on
+# the bus. Those fail differently and the difference is the whole point, so
+# each one is reported by name rather than rolled into one verdict.
+mkdir -p /dev || exit 21
+mount -t devtmpfs dev /dev || exit 22
+mkdir -p /proc /sys 2>/dev/null
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+say() { echo "userspace: $1" > /dev/kmsg; }
+say "init-vsock starting"
+
+for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
+  if insmod /opt/$m.ko 2>/tmp/e; then say "insmod $m ok"
+  else say "insmod $m FAILED: $(cat /tmp/e)"; fi
+done
+say "modules loaded: $(cat /proc/modules | cut -d' ' -f1 | tr '\n' ' ')"
+
+# The device, seen from the bus rather than from the socket layer.
+for d in /sys/bus/virtio/devices/*; do
+  [ -e "$d/device" ] || continue
+  say "virtio device $(basename $d) id $(cat $d/device) vendor $(cat $d/vendor 2>/dev/null)"
+done
+[ -c /dev/vsock ] && say "/dev/vsock exists" || say "/dev/vsock absent"
+if [ -r /sys/module/vmw_vsock_virtio_transport/parameters ]; then say "transport module present"; fi
+
+/opt/vsock_client 1234 "hello from the guest" > /tmp/out 2>&1
+rc=$?
+say "vsock_client exit $rc: $(cat /tmp/out | tr '\n' ' ')"
+
+# A second stream, big enough to cross many receive buffers in both
+# directions. One short message fits in one buffer and never asks the device
+# whether credit, refill or ordering work.
+# It is also the second stream on a device that has already closed one, which
+# is its own thing to get wrong.
+/opt/vsock_client 1234 bulk 65536 > /tmp/out2 2>&1
+rc2=$?
+say "vsock_bulk exit $rc2: $(cat /tmp/out2 | tr '\n' ' ')"
+say "init-vsock done"
+poweroff -f
+exit 99

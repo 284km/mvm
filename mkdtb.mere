@@ -114,6 +114,15 @@ let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) -
       let _ = pc "interrupts" [0, 16, 4] in
     let _ = en () in
 
+    // The second transport. vsock's queues are the same shape as the block
+    // device's, but what is behind them is not, so it gets its own window and
+    // its own interrupt rather than sharing either.
+    let _ = bn "virtio_mmio@a000200" in
+      let _ = ps "compatible" "virtio,mmio" in
+      let _ = pc "reg" [0, 0xa000200, 0, 0x200] in
+      let _ = pc "interrupts" [0, 17, 4] in
+    let _ = en () in
+
     let _ = bn "apb-pclk" in
       let _ = ps "compatible" "fixed-clock" in
       let _ = pu "#clock-cells" 0 in

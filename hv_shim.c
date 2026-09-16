@@ -18,6 +18,10 @@
 #include <unistd.h>
 #include <time.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <errno.h>
+#include <poll.h>
 
 static hv_vcpu_t VCPU;
 static hv_vcpu_exit_t *EXIT;
@@ -230,6 +234,11 @@ int hv_write_u16(const char *gpa_hex, int v) {
     if (!p) return -1;
     uint16_t x = (uint16_t)v; memcpy(p, &x, 2); return 0;
 }
+int hv_write_u64(const char *gpa_hex, const char *val_hex) {
+    void *p = at(hex64(gpa_hex), 8);
+    if (!p) return -1;
+    uint64_t v = hex64(val_hex); memcpy(p, &v, 8); return 0;
+}
 const char *hv_read_u64(const char *gpa_hex) {
     void *p = at(hex64(gpa_hex), 8);
     if (!p) return put64(0);
@@ -320,3 +329,136 @@ int hv_start_deadline(int ms) {
     return 0;
 }
 int hv_deadline_fired(void) { return DEADLINE_FIRED; }
+
+/* ---- vsock's host end ----------------------------------------------------
+ *
+ * A vsock stream has two halves. The guest's is a virtio queue; the host's is
+ * an ordinary socket, because reaching something outside the VM is the entire
+ * purpose of the device. Bytes move between guest RAM and that socket here,
+ * for the same reason the block device's do: Mere drives the protocol, C moves
+ * the bulk.
+ *
+ * Non-blocking, and asked rather than waited on. A VMM that blocks in a host
+ * read has stopped being a VMM -- the vCPU is not running while it waits, and
+ * a guest that is not running cannot be the one that fills the queue.
+ */
+#define VS_MAX 8
+static int VS_FD[VS_MAX];
+static int VS_INIT;
+
+static void vs_init(void) {
+    if (VS_INIT) return;
+    for (int i = 0; i < VS_MAX; i++) VS_FD[i] = -1;
+    VS_INIT = 1;
+}
+static int vs_ok(int h) { vs_init(); return h >= 0 && h < VS_MAX && VS_FD[h] >= 0; }
+
+/* Connect to a host AF_UNIX path. A small handle, or -1. */
+int hv_vs_connect(const char *path) {
+    vs_init();
+    int h = -1;
+    for (int i = 0; i < VS_MAX; i++) if (VS_FD[i] < 0) { h = i; break; }
+    if (h < 0) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    VS_FD[h] = fd;
+    return h;
+}
+
+int hv_vs_close(int h) {
+    if (!vs_ok(h)) return -1;
+    close(VS_FD[h]); VS_FD[h] = -1; return 0;
+}
+
+/* Guest RAM -> the host socket. All of it, or -1. */
+int hv_vs_send(int h, const char *gpa_hex, int len) {
+    if (!vs_ok(h) || len < 0) return -1;
+    const char *p = at(hex64(gpa_hex), (size_t)len);
+    if (!p) return -1;
+    int off = 0;
+    while (off < len) {
+        ssize_t n = write(VS_FD[h], p + off, (size_t)(len - off));
+        if (n > 0) { off += (int)n; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pf; pf.fd = VS_FD[h]; pf.events = POLLOUT; pf.revents = 0;
+            if (poll(&pf, 1, 1000) <= 0) return -1;
+            continue;
+        }
+        return -1;
+    }
+    return off;
+}
+
+/* The host socket -> guest RAM. 0 when nothing is ready yet, -2 at end of
+ * file. Those are three different answers and the caller needs all three:
+ * "nothing yet" means wait, "end of file" means tell the guest so. */
+int hv_vs_recv(int h, const char *gpa_hex, int max) {
+    if (!vs_ok(h) || max <= 0) return -1;
+    void *p = at(hex64(gpa_hex), (size_t)max);
+    if (!p) return -1;
+    ssize_t n = read(VS_FD[h], p, (size_t)max);
+    if (n > 0) return (int)n;
+    if (n == 0) return -2;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+    return -1;
+}
+
+/* Is there anything to read? Asked on every WFI, so it may not block. */
+int hv_vs_ready(int h) {
+    if (!vs_ok(h)) return 0;
+    struct pollfd pf; pf.fd = VS_FD[h]; pf.events = POLLIN; pf.revents = 0;
+    if (poll(&pf, 1, 0) <= 0) return 0;
+    return (pf.revents & (POLLIN | POLLHUP)) ? 1 : 0;
+}
+
+/* A thread that wakes the vCPU when the host end has something to say.
+ *
+ * WHY A THREAD. The same reason the deadline needs one: hv_vcpu_run blocks,
+ * and a guest blocked in read() on a vsock stream is idle, so the loop that
+ * would poll the host socket is not running. Masking the virtual timer -- what
+ * this VMM does on every timer exit -- removes the last thing that was waking
+ * it, and the measurement said so: 4 polls in 52,189 exits, then eight seconds
+ * of nothing.
+ *
+ * It signals rather than copies: everything about the queue still happens on
+ * the vCPU's thread, and this only decides WHEN.
+ */
+static volatile int VS_WATCH_H = -1;
+static volatile int VS_WATCH_RUN;
+
+static void *vs_watch_thread(void *arg) {
+    (void)arg;
+    while (VS_WATCH_RUN) {
+        int h = VS_WATCH_H;
+        if (h < 0 || h >= VS_MAX || VS_FD[h] < 0) {
+            struct timespec ts = { 0, 5 * 1000 * 1000L }; nanosleep(&ts, NULL);
+            continue;
+        }
+        struct pollfd pf; pf.fd = VS_FD[h]; pf.events = POLLIN; pf.revents = 0;
+        if (poll(&pf, 1, 20) > 0) {
+            hv_vcpu_t v = VCPU;
+            hv_vcpus_exit(&v, 1);
+            /* The data is still readable until the vCPU's thread takes it, so
+             * without a pause this spins on the same readiness. */
+            struct timespec ts = { 0, 2 * 1000 * 1000L }; nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
+int hv_vs_wake_on(int h) {
+    VS_WATCH_H = h;
+    if (VS_WATCH_RUN) return 0;
+    VS_WATCH_RUN = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, vs_watch_thread, NULL) != 0) { VS_WATCH_RUN = 0; return -1; }
+    pthread_detach(t);
+    return 0;
+}
