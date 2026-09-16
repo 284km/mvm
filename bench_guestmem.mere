@@ -1,0 +1,63 @@
+// bench_guestmem.mere — is copying guest memory fast enough for a block device?
+//
+// The plan predicted that virtio would force a language change: `Raw`, Mere's
+// window onto physical memory, has one source today and giving it a second is
+// a change to what the language guarantees. Before making it, the question is
+// whether the copy it would avoid actually costs anything.
+//
+// The shape of the load is a block device's: per request, a handful of small
+// reads to walk a descriptor chain, then one bulk transfer of the data.
+
+extern fn hv_up: unit -> int;
+extern fn hv_map: str -> int -> int;
+extern fn hv_read_u32: str -> int;
+extern fn hv_read_u16: str -> int;
+extern fn hv_write_u16: str -> int -> int;
+extern fn hv_read_u64: str -> str;
+extern fn hv_file_to_guest: str -> int -> str -> int -> int;
+extern fn now_ms: unit -> int;
+
+let base = "0x40000000";
+
+let hex = fn (v: int) ->
+  let digits = "0123456789abcdef" in
+  let rec go = fn (n: int) -> fn (acc: str) ->
+    if n == 0 then acc else go (n / 16) (char_at digits (n % 16) ++ acc) in
+  if v == 0 then "0" else go v "";
+let gpa = fn (off: int) -> "0x" ++ hex (0x40000000 + off);
+
+let bench = fn (reqs: int) -> fn (bufsize: int) -> fn (disk: str) ->
+  let _ = hv_up () in
+  let _ = hv_map base 268435456 in          // 256 MiB
+  let t0 = now_ms () in
+  // Per request: ten field accesses walking a descriptor chain, then the data.
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i == reqs then acc
+    else
+      let d = 4096 + (i % 64) * 16 in
+      let a = hv_read_u32 (gpa d) in
+      let b = hv_read_u16 (gpa (d + 4)) in
+      let c = hv_read_u16 (gpa (d + 6)) in
+      let e = hv_read_u32 (gpa (d + 8)) in
+      let f = hv_read_u16 (gpa (d + 12)) in
+      let _ = hv_write_u16 (gpa (d + 14)) (bit_and i 65535) in
+      let _ = hv_read_u64 (gpa (d + 16)) in
+      let g = hv_read_u32 (gpa (d + 24)) in
+      let h = hv_read_u16 (gpa (d + 28)) in
+      let k = hv_read_u16 (gpa (d + 30)) in
+      let n = hv_file_to_guest disk ((i * bufsize) % 8388608) (gpa 1048576) bufsize in
+      go (i + 1) (acc + a + b + c + e + f + g + h + k + n) in
+  let checked = go 0 0 in
+  let t1 = now_ms () in
+  let ms = t1 - t0 in
+  let bytes = reqs * bufsize in
+  let _ = print ("requests=" ++ show reqs ++ " buf=" ++ show bufsize
+                 ++ " ms=" ++ show ms
+                 ++ " MB/s=" ++ show (if ms == 0 then 0 else bytes / 1048576 * 1000 / ms)
+                 ++ " per-request-us=" ++ show (if reqs == 0 then 0 else ms * 1000 / reqs)) in
+  let _ = print ("checksum=" ++ show (bit_and checked 65535)) in
+  ();
+
+match args () with
+| [r, b, disk] -> bench (int_of_str r) (int_of_str b) disk
+| _ -> let _ = print_err "usage: bench_guestmem <requests> <bufsize> <diskfile>" in exit 2

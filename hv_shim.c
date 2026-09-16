@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 static hv_vcpu_t VCPU;
 static hv_vcpu_exit_t *EXIT;
@@ -194,4 +196,82 @@ const char *hv_gic_redist_base_of_vcpu(void) {
     hv_ipa_t b = 0;
     if (hv_gic_get_redistributor_base(VCPU, &b) != HV_SUCCESS) return put64(0);
     return put64(b);
+}
+
+/* ---- guest memory, by copy ---------------------------------------------- */
+/*
+ * A virtio queue lives in the guest's RAM: descriptors, the available and used
+ * rings, and the buffers they point at. The VMM has to read and write all of
+ * it, and the question is whether it does so through a window value or by
+ * copying.
+ *
+ * These copy. Whether that is acceptable is a measurement, not an opinion, and
+ * the answer is in bench/. A copy of the data buffer costs one memcpy per
+ * request on top of the read that produced it.
+ */
+int hv_read_u32(const char *gpa_hex) {
+    void *p = at(hex64(gpa_hex), 4);
+    if (!p) return 0;
+    uint32_t v; memcpy(&v, p, 4); return (int)v;
+}
+int hv_read_u16(const char *gpa_hex) {
+    void *p = at(hex64(gpa_hex), 2);
+    if (!p) return 0;
+    uint16_t v; memcpy(&v, p, 2); return (int)v;
+}
+int hv_write_u32(const char *gpa_hex, int v) {
+    void *p = at(hex64(gpa_hex), 4);
+    if (!p) return -1;
+    uint32_t x = (uint32_t)v; memcpy(p, &x, 4); return 0;
+}
+int hv_write_u16(const char *gpa_hex, int v) {
+    void *p = at(hex64(gpa_hex), 2);
+    if (!p) return -1;
+    uint16_t x = (uint16_t)v; memcpy(p, &x, 2); return 0;
+}
+const char *hv_read_u64(const char *gpa_hex) {
+    void *p = at(hex64(gpa_hex), 8);
+    if (!p) return put64(0);
+    uint64_t v; memcpy(&v, p, 8); return put64(v);
+}
+
+/* Bulk: guest RAM to a file and back, which is what a block device moves.
+ * Returns the number of bytes, or -1. */
+/* Bulk: guest RAM to a file and back, which is what a block device moves.
+ *
+ * The disk is opened ONCE. Opening it per request cost 53 microseconds and made
+ * the copy look expensive: the first measurement reported the same per-request
+ * time for a 4 KiB transfer and a 64 KiB one, which is the shape of a fixed
+ * cost and not of a copy.
+ */
+static int DISK_FD = -1;
+static char DISK_PATH[1024];
+
+static int disk_open(const char *path) {
+    if (DISK_FD >= 0 && !strcmp(DISK_PATH, path)) return DISK_FD;
+    if (DISK_FD >= 0) close(DISK_FD);
+    DISK_FD = open(path, O_RDWR);
+    if (DISK_FD < 0) DISK_FD = open(path, O_RDONLY);
+    if (DISK_FD >= 0) snprintf(DISK_PATH, sizeof DISK_PATH, "%s", path);
+    return DISK_FD;
+}
+
+long long hv_file_to_guest(const char *path, long long off, const char *gpa_hex, int len) {
+    void *p = at(hex64(gpa_hex), (size_t)len);
+    if (!p) return -1;
+    int fd = disk_open(path);
+    if (fd < 0) return -1;
+    ssize_t n = pread(fd, p, (size_t)len, (off_t)off);
+    if (n < 0) return -1;
+    memset((char *)p + n, 0, (size_t)len - (size_t)n);   /* a short read is zeroes */
+    return (long long)n;
+}
+
+long long hv_guest_to_file(const char *gpa_hex, int len, const char *path, long long off) {
+    void *p = at(hex64(gpa_hex), (size_t)len);
+    if (!p) return -1;
+    int fd = disk_open(path);
+    if (fd < 0) return -1;
+    ssize_t n = pwrite(fd, p, (size_t)len, (off_t)off);
+    return n < 0 ? -1 : (long long)n;
 }
