@@ -98,3 +98,100 @@ const char *hv_exit_syndrome(void) { return put64(EXIT ? EXIT->exception.syndrom
 const char *hv_exit_va(void) { return put64(EXIT ? EXIT->exception.virtual_address : 0); }
 /* EC is the top six bits of the syndrome: which KIND of exception this was. */
 int hv_exit_ec(void) { return EXIT ? (int)((EXIT->exception.syndrome >> 26) & 0x3f) : -1; }
+
+/* ---- the GIC ------------------------------------------------------------ */
+/*
+ * macOS provides the interrupt controller: hv_gic_create takes a config with
+ * the distributor and redistributor base addresses and the framework emulates
+ * GICv3 behind them. The alternative is several thousand lines of register
+ * emulation, so the addresses in the device tree are chosen to match what is
+ * passed here -- one file decides both, which is why the tree is generated
+ * rather than compiled from a separate source.
+ */
+int hv_gic_up(const char *dist_hex, const char *redist_hex) {
+    hv_gic_config_t cfg = hv_gic_config_create();
+    if (!cfg) return -1;
+    hv_return_t r = hv_gic_config_set_distributor_base(cfg, hex64(dist_hex));
+    if (r != HV_SUCCESS) return (int)r;
+    r = hv_gic_config_set_redistributor_base(cfg, hex64(redist_hex));
+    if (r != HV_SUCCESS) return (int)r;
+    return (int)hv_gic_create(cfg);
+}
+
+/* ---- loading ------------------------------------------------------------ */
+long long hv_load_file(const char *path, const char *gpa_hex) {
+    uint64_t gpa = hex64(gpa_hex);
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    void *p = at(gpa, (size_t)sz);
+    if (!p) { fclose(f); return -2; }
+    size_t got = fread(p, 1, (size_t)sz, f);
+    fclose(f);
+    return (long long)got;
+}
+
+/* ---- decoding an exit --------------------------------------------------- */
+/* The instruction-specific syndrome, which for a data abort says which
+ * register, how wide, and which direction. */
+int hv_exit_iss(void) { return EXIT ? (int)(EXIT->exception.syndrome & 0x1ffffff) : 0; }
+
+/* Step over the instruction that faulted. AArch64 instructions are four bytes;
+ * a fault that is not retried has to be stepped past or the guest runs it
+ * again forever. */
+int hv_advance_pc(void) {
+    uint64_t pc = 0;
+    hv_return_t r = hv_vcpu_get_reg(VCPU, HV_REG_PC, &pc);
+    if (r != HV_SUCCESS) return (int)r;
+    return (int)hv_vcpu_set_reg(VCPU, HV_REG_PC, pc + 4);
+}
+
+/* HVF reports the virtual timer becoming active; masking it and continuing is
+ * what a VMM with nothing else to do about it does. */
+int hv_mask_vtimer(void) { return (int)hv_vcpu_set_vtimer_mask(VCPU, true); }
+
+/* Sys regs by name, so a caller does not carry Apple's enum values. */
+int hv_set_sys(const char *name, const char *val_hex) {
+    hv_sys_reg_t r;
+    if (!strcmp(name, "CNTV_CTL_EL0")) r = HV_SYS_REG_CNTV_CTL_EL0;
+    else if (!strcmp(name, "MIDR_EL1")) r = HV_SYS_REG_MIDR_EL1;
+    // The framework places a vCPU's redistributor from its AFFINITY, and the
+    // header says so: hv_gic_get_redistributor_base "must be called after the
+    // affinity of the given vCPU has been set in its MPIDR_EL1 register".
+    // Without that it answers HV_BAD_ARGUMENT and the redistributor is not
+    // anywhere -- which the guest discovers as a data abort in the middle of
+    // GIC initialisation.
+    else if (!strcmp(name, "MPIDR_EL1")) r = HV_SYS_REG_MPIDR_EL1;
+    else return -1;
+    return (int)hv_vcpu_set_sys_reg(VCPU, r, hex64(val_hex));
+}
+
+/* The guest's PHYSICAL address for a fault. virtual_address is the address in
+ * the guest's own page tables, which is where the kernel mapped the device --
+ * not where the device is. Dispatching on it sends every MMIO access to
+ * "unhandled", which is what it did. */
+const char *hv_exit_pa(void) { return put64(EXIT ? EXIT->exception.physical_address : 0); }
+
+/* ---- the GIC's own geometry -------------------------------------------- */
+/*
+ * Ask the framework how big its distributor and redistributor windows are,
+ * rather than writing 0x10000 and 0x100000 into a device tree and hoping. The
+ * kernel probes to the end of the window it is told about; a window described
+ * larger than the one the framework answers for produces a data abort in the
+ * middle of GIC initialisation, at an address that looks arbitrary
+ * (0x80affe8 -- the PIDR2 register at the end of a frame that was not there).
+ */
+long long hv_gic_dist_size(void) { size_t v = 0; return hv_gic_get_distributor_size(&v) == HV_SUCCESS ? (long long)v : -1; }
+long long hv_gic_redist_size(void) { size_t v = 0; return hv_gic_get_redistributor_size(&v) == HV_SUCCESS ? (long long)v : -1; }
+long long hv_gic_dist_align(void) { size_t v = 0; return hv_gic_get_distributor_base_alignment(&v) == HV_SUCCESS ? (long long)v : -1; }
+long long hv_gic_redist_align(void) { size_t v = 0; return hv_gic_get_redistributor_base_alignment(&v) == HV_SUCCESS ? (long long)v : -1; }
+long long hv_gic_redist_region_size(void) { size_t v = 0; return hv_gic_get_redistributor_region_size(&v) == HV_SUCCESS ? (long long)v : -1; }
+
+/* Where the framework actually put this vCPU's redistributor. It assigns them
+ * itself from the region the config named; the device tree has to describe
+ * where they ARE, not where the region started. */
+const char *hv_gic_redist_base_of_vcpu(void) {
+    hv_ipa_t b = 0;
+    if (hv_gic_get_redistributor_base(VCPU, &b) != HV_SUCCESS) return put64(0);
+    return put64(b);
+}

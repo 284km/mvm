@@ -1,0 +1,139 @@
+// fdt.mere — a flattened device tree, built rather than compiled.
+//
+// The kernel is handed a DTB describing the memory, the CPUs, the interrupt
+// controller, PSCI, the timer and the console. Producing it with `dtc` from a
+// source file would work and would mean the VMM does not know what it is
+// telling the guest -- the addresses in the tree have to agree with the ones
+// the emulator answers at, and two files that have to agree are two files that
+// can disagree.
+//
+// The format (devicetree specification, v0.4): a 40-byte big-endian header, a
+// memory-reservation block, a structure block of tokens, and a strings block
+// that property names point into. `dtc -I dtb -O dts` reads back what this
+// writes, which is how it is checked.
+
+let fdt_magic = 0xd00dfeed;
+let fdt_begin_tok = 1;
+let fdt_end_tok = 2;
+let fdt_prop_tok = 3;
+let fdt_end_all = 9;
+let fdt_version = 17;
+let fdt_last_comp = 16;
+
+// Everything in a DTB is big-endian, including on a little-endian machine.
+let push_be32 = fn (b: ByteBuf[R]) -> fn (v: int) ->
+  let _ = bytebuf_push b (bit_and (bit_shr v 24) 255) in
+  let _ = bytebuf_push b (bit_and (bit_shr v 16) 255) in
+  let _ = bytebuf_push b (bit_and (bit_shr v 8) 255) in
+  let _ = bytebuf_push b (bit_and v 255) in
+  ();
+
+let push_str0 = fn (b: ByteBuf[R]) -> fn (s: str) ->
+  let n = str_len s in
+  let rec go = fn (i: int) ->
+    if i == n then () else let _ = bytebuf_push b (ord (char_at s i)) in go (i + 1) in
+  let _ = go 0 in
+  let _ = bytebuf_push b 0 in
+  ();
+
+// Tokens and property values are aligned to four bytes.
+let pad4 = fn (b: ByteBuf[R]) ->
+  let rec go = fn (u: unit) ->
+    if bytebuf_len b % 4 == 0 then () else let _ = bytebuf_push b 0 in go () in
+  go ();
+
+// A property name is stored once in the strings block and referred to by
+// offset. Reusing an offset for a repeated name is not an optimisation here --
+// it is what keeps the strings block small enough to read when this goes wrong.
+let str_offset = fn (strs: ByteBuf[R]) -> fn (name: str) ->
+  let n = bytebuf_len strs in
+  let m = str_len name in
+  // Look for the name already present, terminator included.
+  let rec find = fn (i: int) ->
+    if i + m + 1 > n then 0 - 1
+    else
+      let rec same = fn (k: int) ->
+        if k == m then bytebuf_get strs (i + k) == 0
+        else if bytebuf_get strs (i + k) == ord (char_at name k) then same (k + 1)
+        else false in
+      // Only match at the start of an entry: a suffix match would hand out an
+      // offset into the middle of another name.
+      let at_start = if i == 0 then true else bytebuf_get strs (i - 1) == 0 in
+      if at_start then (if same 0 then i else find (i + 1)) else find (i + 1) in
+  let found = find 0 in
+  if found >= 0 then found
+  else let _ = push_str0 strs name in n;
+
+let begin_node = fn (st: ByteBuf[R]) -> fn (name: str) ->
+  let _ = push_be32 st fdt_begin_tok in
+  let _ = push_str0 st name in
+  pad4 st;
+
+let end_node = fn (st: ByteBuf[R]) -> let _ = push_be32 st fdt_end_tok in ();
+
+let prop_raw = fn (st: ByteBuf[R]) -> fn (strs: ByteBuf[R]) -> fn (name: str) ->
+               fn (len: int) -> fn (emit: unit -> unit) ->
+  let off = str_offset strs name in
+  let _ = push_be32 st fdt_prop_tok in
+  let _ = push_be32 st len in
+  let _ = push_be32 st off in
+  let _ = emit () in
+  pad4 st;
+
+let prop_empty = fn (st: ByteBuf[R]) -> fn (strs: ByteBuf[R]) -> fn (name: str) ->
+  prop_raw st strs name 0 (fn (u: unit) -> ());
+
+let prop_u32 = fn (st: ByteBuf[R]) -> fn (strs: ByteBuf[R]) -> fn (name: str) -> fn (v: int) ->
+  prop_raw st strs name 4 (fn (u: unit) -> push_be32 st v);
+
+let prop_str = fn (st: ByteBuf[R]) -> fn (strs: ByteBuf[R]) -> fn (name: str) -> fn (v: str) ->
+  prop_raw st strs name (str_len v + 1) (fn (u: unit) -> push_str0 st v);
+
+// A list of 32-bit cells, which is how reg and interrupts are written.
+let rec push_cells = fn (st: ByteBuf[R]) -> fn (xs: int list) ->
+  match xs with
+  | [] -> ()
+  | [h, ...t] -> let _ = push_be32 st h in push_cells st t;
+
+let rec list_len = fn (xs: int list) ->
+  match xs with | [] -> 0 | [h, ...t] -> 1 + list_len t;
+
+let prop_cells = fn (st: ByteBuf[R]) -> fn (strs: ByteBuf[R]) -> fn (name: str) ->
+                 fn (xs: int list) ->
+  prop_raw st strs name (4 * list_len xs) (fn (u: unit) -> push_cells st xs);
+
+// Two strings in one property, which is what compatible and clock-names want.
+let prop_strs2 = fn (st: ByteBuf[R]) -> fn (strs: ByteBuf[R]) -> fn (name: str) ->
+                 fn (a: str) -> fn (b: str) ->
+  prop_raw st strs name (str_len a + str_len b + 2)
+    (fn (u: unit) -> let _ = push_str0 st a in push_str0 st b);
+
+// Assemble: header, reservation block, structure, strings.
+let fdt_finish = fn (st: ByteBuf[R]) -> fn (strs: ByteBuf[R]) ->
+  let _ = push_be32 st fdt_end_all in
+  let hdr = 40 in
+  let rsv = 16 in                       // one terminating (0,0) entry
+  let off_struct = hdr + rsv in
+  let size_struct = bytebuf_len st in
+  let off_strings = off_struct + size_struct in
+  let size_strings = bytebuf_len strs in
+  let total = off_strings + size_strings in
+  let out = bytebuf_new 0 in
+  let _ = push_be32 out fdt_magic in
+  let _ = push_be32 out total in
+  let _ = push_be32 out off_struct in
+  let _ = push_be32 out off_strings in
+  let _ = push_be32 out hdr in          // off_mem_rsvmap
+  let _ = push_be32 out fdt_version in
+  let _ = push_be32 out fdt_last_comp in
+  let _ = push_be32 out 0 in            // boot_cpuid_phys
+  let _ = push_be32 out size_strings in
+  let _ = push_be32 out size_struct in
+  let _ = push_be32 out 0 in let _ = push_be32 out 0 in   // reservation: terminator
+  let _ = push_be32 out 0 in let _ = push_be32 out 0 in
+  let rec copy = fn (src: ByteBuf[R]) -> fn (i: int) ->
+    if i == bytebuf_len src then ()
+    else let _ = bytebuf_push out (bytebuf_get src i) in copy src (i + 1) in
+  let _ = copy st 0 in
+  let _ = copy strs 0 in
+  bytes_of_bytebuf out;

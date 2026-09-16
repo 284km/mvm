@@ -1,0 +1,120 @@
+// mkdtb.mere — write the device tree this VMM hands its guest.
+//
+//   mkdtb <out.dtb>
+//
+// Separate from the VMM so `dtc -I dtb -O dts` can read it back without
+// starting a virtual machine. The addresses here are the ones the emulator
+// answers at; they are constants in one file for that reason.
+
+import "fdt.mere";
+
+// The GIC's window sizes come from the framework that implements it, not from
+// this file. Writing 0x100000 here because it looked like enough produced a
+// data abort in the middle of GICv3 initialisation, at an address inside the
+// window the tree claimed and outside the one the framework answers for.
+extern fn hv_up: unit -> int;
+extern fn hv_gic_dist_size: unit -> int;
+extern fn hv_gic_redist_size: unit -> int;
+
+let ram_base    = 0x40000000;
+let ram_size_mb = 1024;
+let uart_base   = 0x9000000;
+let gic_dist    = 0x8000000;
+let gic_redist  = 0x80a0000;
+
+let phandle_gic = 1;
+let phandle_clk = 2;
+
+let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) ->
+  let st = bytebuf_new 0 in
+  let strs = bytebuf_new 0 in
+  let bn = begin_node st in
+  let en = fn (u: unit) -> end_node st in
+  let ps = prop_str st strs in
+  let pu = prop_u32 st strs in
+  let pc = prop_cells st strs in
+  let pe = prop_empty st strs in
+  let p2 = prop_strs2 st strs in
+
+  let _ = bn "" in
+    let _ = pu "#address-cells" 2 in
+    let _ = pu "#size-cells" 2 in
+    let _ = ps "compatible" "linux,dummy-virt" in
+    let _ = pu "interrupt-parent" phandle_gic in
+
+    let _ = bn "chosen" in
+      let _ = ps "bootargs" bootargs in
+      let _ = ps "stdout-path" "/pl011@9000000" in
+    let _ = en () in
+
+    // reg is <hi lo hi lo> because #address-cells and #size-cells are 2.
+    let _ = bn "memory@40000000" in
+      let _ = ps "device_type" "memory" in
+      let _ = pc "reg" [0, ram_base, 0, ram_size_mb * 1048576] in
+    let _ = en () in
+
+    let _ = bn "cpus" in
+      let _ = pu "#address-cells" 1 in
+      let _ = pu "#size-cells" 0 in
+      let _ = bn "cpu@0" in
+        let _ = ps "device_type" "cpu" in
+        let _ = ps "compatible" "arm,armv8" in
+        let _ = pu "reg" 0 in
+        let _ = ps "enable-method" "psci" in
+      let _ = en () in
+    let _ = en () in
+
+    // The kernel calls PSCI through HVC, which lands in this VMM as an exit.
+    let _ = bn "psci" in
+      let _ = ps "compatible" "arm,psci-1.0" in
+      let _ = ps "method" "hvc" in
+    let _ = en () in
+
+    // The four generic-timer PPIs. 0x108 is level-triggered on all CPUs.
+    let _ = bn "timer" in
+      let _ = ps "compatible" "arm,armv8-timer" in
+      let _ = pc "interrupts" [1, 13, 0x108, 1, 14, 0x108, 1, 11, 0x108, 1, 10, 0x108] in
+      let _ = pe "always-on" in
+    let _ = en () in
+
+    let _ = bn "intc@8000000" in
+      let _ = ps "compatible" "arm,gic-v3" in
+      let _ = pu "#interrupt-cells" 3 in
+      let _ = pu "#address-cells" 2 in
+      let _ = pu "#size-cells" 2 in
+      let _ = pe "interrupt-controller" in
+      let _ = pe "ranges" in
+      let _ = pc "reg" [0, gic_dist, 0, dist_size, 0, gic_redist, 0, redist_size] in
+      let _ = pu "phandle" phandle_gic in
+    let _ = en () in
+
+    let _ = bn "pl011@9000000" in
+      let _ = p2 "compatible" "arm,pl011" "arm,primecell" in
+      let _ = pc "reg" [0, uart_base, 0, 0x1000] in
+      let _ = pc "interrupts" [0, 1, 4] in
+      let _ = pc "clocks" [phandle_clk, phandle_clk] in
+      let _ = p2 "clock-names" "uartclk" "apb_pclk" in
+    let _ = en () in
+
+    let _ = bn "apb-pclk" in
+      let _ = ps "compatible" "fixed-clock" in
+      let _ = pu "#clock-cells" 0 in
+      let _ = pu "clock-frequency" 24000000 in
+      let _ = ps "clock-output-names" "clk24mhz" in
+      let _ = pu "phandle" phandle_clk in
+    let _ = en () in
+  let _ = en () in
+  fdt_finish st strs;
+
+match args () with
+| [out] ->
+    // A VM has to exist before the framework will answer for its GIC.
+    let _ = hv_up () in
+    let ds = hv_gic_dist_size () in
+    let rs = hv_gic_redist_size () in
+    let _ = if ds <= 0 then let _ = print_err "mkdtb: the framework would not give a distributor size" in exit 1 else 0 in
+    let _ = if rs <= 0 then let _ = print_err "mkdtb: the framework would not give a redistributor size" in exit 1 else 0 in
+    let b = build "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1" ds rs in
+    let _ = write_bytes out b in
+    print_err ("mkdtb: wrote " ++ out ++ "  (gic dist 0x" ++ show ds ++ ", redist 0x" ++ show rs ++ ")")
+| _ -> let _ = print_err "usage: mkdtb <out.dtb>" in exit 2

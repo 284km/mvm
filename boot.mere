@@ -1,0 +1,195 @@
+// boot.mere — start a Linux kernel and listen to what it says.
+//
+//   mvm-boot <Image> <dtb>
+//
+// The judgement for this step is not "the header parsed" or "the tree
+// validated". It is whether the guest SAYS something: a kernel that reaches
+// its own early console has a working CPU, memory map, interrupt controller
+// and timer, and nothing about that can be faked by a VMM that merely started.
+
+extern fn hv_up: unit -> int;
+extern fn hv_map: str -> int -> int;
+extern fn hv_gic_up: str -> str -> int;
+extern fn hv_load_file: str -> str -> int;
+extern fn hv_vcpu_new: unit -> int;
+extern fn hv_set_x: int -> str -> int;
+extern fn hv_get_x: int -> str;
+extern fn hv_set_pc: str -> int;
+extern fn hv_get_pc: unit -> str;
+extern fn hv_set_cpsr: str -> int;
+extern fn hv_run: unit -> int;
+extern fn hv_exit_reason: unit -> int;
+extern fn hv_exit_ec: unit -> int;
+extern fn hv_exit_iss: unit -> int;
+extern fn hv_exit_va: unit -> str;
+extern fn hv_exit_pa: unit -> str;
+extern fn hv_advance_pc: unit -> int;
+extern fn hv_mask_vtimer: unit -> int;
+extern fn hv_set_sys: str -> str -> int;
+extern fn hv_gic_redist_base_of_vcpu: unit -> str;
+
+let ram_base_hex = "0x40000000";
+let ram_base = 0x40000000;
+let ram_bytes = 1073741824;                 // 1 GiB, and the kernel wants 60 MiB of it
+let dtb_gpa = 0x48000000;                   // above the kernel image, 2 MiB aligned
+let dtb_gpa_hex = "0x48000000";
+let uart_base = 0x9000000;
+let gic_dist_hex = "0x8000000";
+let gic_redist_hex = "0x80a0000";
+
+// `show` is decimal, and an EC printed as decimal after an "0x" reads as a
+// different exception than it is: EC 24 decimal is 0x18, a trapped system
+// register, and printing it as "0x24" pointed at a data abort instead.
+let hex = fn (v: int) ->
+  let digits = "0123456789abcdef" in
+  let rec go = fn (n: int) -> fn (acc: str) ->
+    if n == 0 then acc else go (n / 16) (char_at digits (n % 16) ++ acc) in
+  if v == 0 then "0" else go v "";
+
+let must = fn (what: str) -> fn (rc: int) ->
+  if rc != 0 then
+    let _ = print_err ("mvm: " ++ what ++ " -> 0x" ++ hex rc) in exit 1
+  else 0;
+
+let hex_val = fn (h: str) ->
+  let n = str_len h in
+  let start = if n > 2 then (if substring h 0 2 == "0x" then 2 else 0) else 0 in
+  let rec go = fn (i: int) -> fn (acc: int) ->
+    if i == n then acc
+    else
+      let c = ord (char_at h i) in
+      if c >= 48 then
+        (if c <= 57 then go (i + 1) (acc * 16 + (c - 48))
+         else if c >= 97 then (if c <= 102 then go (i + 1) (acc * 16 + (c - 87)) else acc)
+         else if c >= 65 then (if c <= 70 then go (i + 1) (acc * 16 + (c - 55)) else acc)
+         else acc)
+      else acc in
+  go start 0;
+
+// Data abort from a lower exception level: the guest touched an address this
+// VMM has not mapped, which is how a device gets to exist.
+let ec_data_abort = 0x24;
+let ec_hvc = 0x16;
+let ec_wfx = 0x01;
+let ec_sysreg = 0x18;
+
+// ISS layout for a data abort: bit 24 ISV, 23-22 size, 20-16 register,
+// bit 6 write.
+let iss_is_write = fn (iss: int) -> bit_and (bit_shr iss 6) 1 == 1;
+let iss_reg = fn (iss: int) -> bit_and (bit_shr iss 16) 31;
+
+let boot = fn (image: str) -> fn (dtb: str) ->
+  let _ = must "hv_vm_create" (hv_up ()) in
+  let _ = must "hv_vm_map" (hv_map ram_base_hex ram_bytes) in
+  // The GIC has to exist before the vCPU, and at the addresses the device tree
+  // told the kernel to look.
+  let _ = must "hv_gic_create" (hv_gic_up gic_dist_hex gic_redist_hex) in
+
+  let n1 = hv_load_file image ram_base_hex in
+  let _ = if n1 <= 0 then let _ = print_err "mvm: cannot load the kernel image" in exit 1 else 0 in
+  let n2 = hv_load_file dtb dtb_gpa_hex in
+  let _ = if n2 <= 0 then let _ = print_err "mvm: cannot load the device tree" in exit 1 else 0 in
+  let _ = print_err ("mvm: kernel " ++ show n1 ++ " bytes, dtb " ++ show n2 ++ " bytes") in
+
+  let _ = must "hv_vcpu_create" (hv_vcpu_new ()) in
+  // The framework places this vCPU's GIC redistributor from its affinity, so
+  // MPIDR_EL1 has to be set before the redistributor exists at all. Bit 31 is
+  // RES1; the rest is affinity 0, this being the only CPU. Without it the
+  // guest reaches GIC initialisation and takes a data abort on a register the
+  // device tree says is there.
+  let _ = must "set MPIDR_EL1" (hv_set_sys "MPIDR_EL1" "0x80000000") in
+  let rb = hv_gic_redist_base_of_vcpu () in
+  let _ = print_err ("mvm: the redistributor for cpu0 is at " ++ rb) in
+  let _ = must "set cpsr" (hv_set_cpsr "0x3c5") in
+  // The boot protocol: x0 holds the device tree, x1-x3 are zero, and the pc is
+  // the start of the image.
+  let _ = must "x0" (hv_set_x 0 dtb_gpa_hex) in
+  let _ = must "x1" (hv_set_x 1 "0x0") in
+  let _ = must "x2" (hv_set_x 2 "0x0") in
+  let _ = must "x3" (hv_set_x 3 "0x0") in
+  let _ = must "set pc" (hv_set_pc ram_base_hex) in
+  let _ = print_err "mvm: running" in
+
+  // The loop. Every exit is either a device this VMM answers for, a PSCI call,
+  // or something it does not know -- and the last one is reported rather than
+  // ignored, because a silently swallowed exit is a guest that stops making
+  // sense somewhere else.
+  let rec run = fn (n: int) -> fn (out: int) ->
+    if n > 4000000 then
+      let _ = print_err ("mvm: stopping after " ++ show n ++ " exits") in out
+    else
+      let rc = hv_run () in
+      if rc != 0 then
+        let _ = print_err ("mvm: hv_vcpu_run -> 0x" ++ hex rc) in out
+      else
+        let reason = hv_exit_reason () in
+        if reason == 2 then let _ = hv_mask_vtimer () in run (n + 1) out
+        else if reason != 1 then
+          let _ = print_err ("mvm: exit reason " ++ show reason) in out
+        else
+          let ec = hv_exit_ec () in
+          if ec == ec_wfx then
+            // Nothing to wait for yet; step over it.
+            let _ = hv_advance_pc () in run (n + 1) out
+          else if ec == ec_hvc then
+            // PSCI. The function id is in x0; everything is answered
+            // "not supported" for now except the ones that end the machine.
+            let f = hex_val (hv_get_x 0) in
+            if f == 0x84000008 then let _ = print_err "mvm: guest called PSCI SYSTEM_OFF" in out
+            else if f == 0x84000009 then let _ = print_err "mvm: guest called PSCI SYSTEM_RESET" in out
+            else
+              let _ = hv_set_x 0 "0xfffffffffffffffe" in   // NOT_SUPPORTED
+              run (n + 1) out
+          else if ec == ec_data_abort then
+            // The PHYSICAL address. virtual_address is where the kernel
+            // mapped the device in its own page tables; the device is at the
+            // address the device tree named, and only the physical one says so.
+            let va = hex_val (hv_exit_pa ()) in
+            let iss = hv_exit_iss () in
+            if va >= uart_base then
+              (if va < uart_base + 4096 then
+                 // The PL011's data register is at offset 0; a write there is
+                 // a character. Everything else in the block reads as zero,
+                 // which is enough for the early console.
+                 let off = va - uart_base in
+                 let _ = if iss_is_write iss then
+                           (if off == 0 then
+                              let c = bit_and (hex_val (hv_get_x (iss_reg iss))) 255 in
+                              print_no_nl (chr c)
+                            else ())
+                         else
+                           // 0x18 is the flag register. The early console polls
+                           // it and will not write a byte until TXFF is clear,
+                           // so answering zero is what lets it speak at all.
+                           let _ = hv_set_x (iss_reg iss) "0x0" in () in
+                 let _ = hv_advance_pc () in
+                 run (n + 1) (out + 1)
+               else
+                 let _ = print_err ("mvm: unhandled data abort at " ++ hv_exit_pa ()) in out)
+            else
+              let _ = print_err ("mvm: unhandled data abort at " ++ hv_exit_pa ()
+                                 ++ " (va " ++ hv_exit_va () ++ ")") in out
+          else if ec == ec_sysreg then
+            // A system register this VMM does not emulate. Reads answer zero,
+            // writes are dropped, and the guest carries on -- which is what
+            // every VMM does with the debug and trace registers a kernel
+            // touches on the way up. The ISS says which register and which
+            // direction; bit 0 set is a read.
+            let iss = hv_exit_iss () in
+            let is_read = bit_and iss 1 == 1 in
+            let rt = bit_and (bit_shr iss 5) 31 in
+            let _ = if is_read then (if rt != 31 then let _ = hv_set_x rt "0x0" in () else ())
+                    else () in
+            let _ = hv_advance_pc () in
+            run (n + 1) out
+          else
+            let _ = print_err ("mvm: unhandled exception ec=0x" ++ hex ec
+                               ++ " iss=0x" ++ hex (hv_exit_iss ())
+                               ++ " pc=" ++ hv_get_pc ()) in out in
+  let printed = run 0 0 in
+  let _ = print_err ("mvm: the guest wrote " ++ show printed ++ " bytes to the console") in
+  ();
+
+match args () with
+| [image, dtb] -> boot image dtb
+| _ -> let _ = print_err "usage: mvm-boot <Image> <dtb>" in exit 2
