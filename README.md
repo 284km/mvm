@@ -644,7 +644,10 @@ that the entitlement survived — a signature that did not travel is a release
 that fails on somebody else's machine and nowhere here.
 
 `test/all.sh` runs the gates cheapest-first and names every one that went red;
-`QUICK=1` stops before the ones that boot a machine. It earned its keep on the
+`QUICK=1` stops before the ones that boot a machine, which takes about a
+minute. `git config core.hooksPath .githooks` runs that minute before every
+push — a runner only helps if somebody runs it, and the thing that reliably
+happens is a push. (`--no-verify` when you mean to.) It earned its keep on the
 first run: `test/run.sh` — the P5.1 milestone, one commit, never touched — had
 been failing silently for months. `hv_map` took an `int` for the size when it
 was written, and grew a `str` when a guest went past 2 GiB; `boot.mere` was

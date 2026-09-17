@@ -1,0 +1,33 @@
+#!/bin/sh
+# .githooks/pre-push — the cheap half of the gates, before anything leaves.
+#
+# WHY. Two gates here were red for months with nobody running them: test/run.sh
+# (the P5.1 milestone, broken by a shim signature that grew past it) and
+# test/hub.sh (checking a decision that had been changed). A runner only helps
+# if somebody runs it, and the thing that reliably happens is a push.
+#
+# THE QUICK SET, not all of it. About a minute: the gates that do not boot a
+# machine. The whole suite is nineteen minutes and belongs to a person who
+# decided to wait for it, not to every push. run.sh is in this set, which is
+# the one that rotted.
+#
+# TURN IT ON WITH:  git config core.hooksPath .githooks
+#
+# A machine that cannot run them is not a machine that failed them: without a
+# compiler this says so and gets out of the way. Blocking a push for a reason
+# that has nothing to do with the push is worse than not checking.
+set -u
+here="$(cd "$(dirname "$0")/.." && pwd)"
+case "$(uname -sm)" in
+  "Darwin arm64") ;;
+  *) echo "pre-push: not macOS on Apple silicon -- the gates cannot run here, not checking" >&2; exit 0;;
+esac
+[ -n "${MERE:-}" ] || { echo "pre-push: MERE is not set -- cannot build, not checking" >&2; exit 0; }
+
+echo "pre-push: the gates that do not boot a machine (about a minute)"
+if QUICK=1 sh "$here/test/all.sh"; then
+  echo "pre-push: ok -- the rest is sh test/all.sh, and it takes nineteen minutes"
+  exit 0
+fi
+echo "pre-push: refusing. Push anyway with --no-verify if you mean to." >&2
+exit 1

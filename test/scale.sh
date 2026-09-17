@@ -71,6 +71,18 @@ cleanup() {
 }
 trap cleanup EXIT
 ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
+# WAITED FOR, NOT SLEPT THROUGH. Counting three seconds after the last client
+# returns is a guess about how fast this machine is, and at eighty containers
+# on one vCPU it is sometimes wrong by one -- which read as a container that
+# never came up. The question is "do they all come up", so it waits until they
+# have or until it is sure they will not.
+upto() {  # upto <n> <seconds>
+  w=0
+  while [ "$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')" -lt "$1" ] && [ "$w" -lt "$2" ]; do
+    sleep 1; w=$((w + 1))
+  done
+  docker ps -q 2>/dev/null | wc -l | tr -d ' '
+}
 # What the VMM's own stream table holds, right now. Two numbers and a total:
 # "<in use> of <max>, <ever refused>".
 streams() { printf 'STREAMS\n' | nc -U "$D/control.sock" 2>/dev/null | head -1; }
@@ -135,14 +147,13 @@ while [ "$i" -lt "$BURST" ]; do
 done
 wait
 t1=$(ms)
-sleep 3
+r=$(upto "$BURST" 60)
 # A CLIENT THAT COULD NOT CONNECT IS NOT A SLOW CLIENT. When the stream table
 # filled, the accept loop stopped, the backlog behind it filled, and the client
 # was told the daemon was not running -- about the one machine that was.
 bad=0
 for e in "$out/scale-burst"/e.*; do [ -s "$e" ] && bad=$((bad + 1)); done
 [ "$bad" = 0 ]; say $? "no client was refused a connection ($bad of $BURST)"
-r=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
 [ "$r" = "$BURST" ]; say $? "all $BURST are running ($r) in $((t1 - t0)) ms"
 [ "$(inuse)" = 0 ]; say $? "and nothing is held afterwards ($(streams))"
 [ "$(refused)" = 0 ]; say $? "and nothing was refused ($(streams))"
@@ -167,14 +178,14 @@ while [ "$i" -lt "$BIG" ]; do
   i=$((i + 1))
 done
 wait
-sleep 3
+big=$(upto "$BIG" 90)
 bad=0
 for e in "$out/scale-big"/e.*; do [ -s "$e" ] && bad=$((bad + 1)); done
 [ "$bad" = 0 ]; say $? "no client was refused a connection at $BIG ($bad)"
 [ "$(refused)" = 0 ]; say $? "the VMM refused nothing at $BIG ($(streams))"
 d=$(grep -a "dropped that inward stream\|gave up telling" "$V" 2>/dev/null | wc -l | tr -d ' ')
 [ "$d" = 0 ]; say $? "and lost no inward stream at $BIG ($d)"
-echo "  note  $(docker ps -q 2>/dev/null | wc -l | tr -d ' ') of $BIG came up -- reported, not required: one vCPU and 32 request slots"
+echo "  note  $big of $BIG came up -- reported, not required: one vCPU and 32 request slots"
 
 echo "== removing them takes their processes =="
 for n in $(docker ps -aq 2>/dev/null); do docker rm -f "$n" >/dev/null 2>&1; done

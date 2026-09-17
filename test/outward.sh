@@ -69,8 +69,26 @@ gw=$(docker run --rm alpine:latest sh -c 'ip route | awk "/^default/{print \$3}"
 [ "$e" = "http://$gw:$port" ]; say $? "it is told the GATEWAY, not 127.0.0.1 ($e, gateway $gw)"
 o=$(docker run --rm alpine:latest wget -q -T 20 -O- http://example.com/ 2>&1 | tr -d '\r' | head -c 200)
 echo "$o" | grep -q "Example Domain"; say $? "plain http through the proxy reaches the world"
-o=$(docker run --rm alpine:latest sh -c 'apk add --no-cache curl >/dev/null 2>&1 && curl -s -o /dev/null -w "%{http_code}" https://example.com/' 2>/dev/null | tr -d '\r')
-[ "$o" = 200 ]; say $? "and https by CONNECT ($o) -- which also means apk reached a mirror"
+# TWO THINGS, ASKED SEPARATELY. This was one line -- apk installs curl, curl
+# fetches over TLS -- and when it failed it said "()" and could not say which
+# half. They are also different kinds of failure: the second is this machine's
+# way out, and the first is somebody's package mirror.
+docker run --rm alpine:latest sh -c 'apk add --no-cache curl >/dev/null 2>&1 && command -v curl >/dev/null' 2>/dev/null
+apk=$?
+if [ "$apk" != 0 ]; then
+  # WHOSE FAILURE IS IT. If this host cannot reach the mirror either, nothing
+  # about the guest has been measured and calling it red would be a lie in the
+  # more expensive direction.
+  if curl -s -o /dev/null --max-time 10 https://dl-cdn.alpinelinux.org/alpine/ 2>/dev/null; then
+    say 1 "apk could not reach a mirror through the proxy (this host can)"
+  else
+    echo "  SKIP  no route to the alpine mirror from this host either -- the TLS check needs one"
+  fi
+else
+  say 0 "apk reached a mirror through the proxy and installed curl"
+  o=$(docker run --rm alpine:latest sh -c 'apk add --no-cache curl >/dev/null 2>&1; curl -s -o /dev/null -w "%{http_code}" --max-time 20 https://example.com/' 2>/dev/null | tr -d '\r')
+  [ "$o" = 200 ]; say $? "and https by CONNECT ($o)"
+fi
 
 echo "== on a network somebody created =="
 docker network create appnet >/dev/null 2>&1; say $? "a network"

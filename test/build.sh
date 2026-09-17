@@ -151,6 +151,31 @@ tar xzf "$arch" -C "$T"
 R=$(ls -d "$T"/mvm-* 2>/dev/null | head -1)
 [ -n "$R" ] && [ -r "$R/INSTALL" ]; say $? "it unpacks, with something that says how to use it"
 ( cd "$R" && sh tools/mvm doctor >/dev/null 2>&1 ); say $? "doctor is green inside the unpacked archive"
+# WHAT IT WOULD NEED ON A MACHINE THAT IS NOT THIS ONE. The nearest thing to
+# another Mac that can be checked here: nothing outside /usr/lib and
+# /System/Library, a guest side that is static, and no dependence on this
+# shell's environment. A binary that picked up Homebrew's OpenSSL would work
+# perfectly here and nowhere else, which is the failure this cannot afford.
+nonsys=0
+for b in mvm-boot mkdtb mports mproxy; do
+  n=$(otool -L "$R/$b" 2>/dev/null | tail -n +2 | awk '{print $1}' \
+      | grep -cv '^/usr/lib/\|^/System/Library/')
+  nonsys=$((nonsys + n))
+done
+[ "$nonsys" = 0 ]; say $? "the host's programs need nothing but macOS itself ($nonsys outside /usr/lib and /System)"
+X="$out/irdcheck"; rm -rf "$X"; mkdir -p "$X"
+( cd "$X" && gzip -dc "$R/initrd-format.gz" | cpio -id --quiet 2>/dev/null )
+st=0
+for b in mengd mrun mfwd; do
+  file "$X/payload/opt/$b" 2>/dev/null | grep -q "statically linked" && st=$((st + 1))
+done
+[ "$st" = 3 ]; say $? "and the guest's are statically linked ($st of 3) -- the guest has no loader to rely on"
+rm -rf "$X"
+# env -i: not one variable of this shell's. MVM_HOME is passed because the
+# check keeps its machines somewhere of its own; a person gets ~/.mvm.
+env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    sh "$R/tools/mvm" doctor >/dev/null 2>&1
+say $? "and none of it depends on this shell's environment (env -i)"
 RM="rel$$"
 env PATH=/usr/bin:/bin:/usr/sbin:/sbin MVM_HOME="$MVM_HOME" \
     sh "$R/tools/mvm" start --name "$RM" --disk-size 1024 > "$out/build-rel.log" 2>&1

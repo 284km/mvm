@@ -137,6 +137,7 @@ doctor() {
     echo "  MISSING permission to run the VMM -- it is quarantined; xattr -d com.apple.quarantine $out/mvm-boot"
     rc=1
   fi
+  orphans
   codesign -dv "$out/mvm-boot" 2>&1 | grep -q "Signature" \
     && echo "  ok    the VMM is signed (Hypervisor.framework refuses an unsigned one)" \
     || { echo "  MISSING a signature on $out/mvm-boot -- codesign --sign - --force --entitlements mvm.entitlements"; rc=1; }
@@ -317,6 +318,36 @@ stop() {
   echo "mvm: $NAME stopped"
 }
 
+# MACHINES NOBODY CAN STOP.
+#
+# `stop` reads $D/vmm.pid, so a state directory that has been deleted leaves a
+# VMM -- and its proxy -- running with nothing in the tool that can reach them.
+# It happens: a machine made for one thing, its directory removed, and the
+# machine still there. Nothing said so until it was found in ps.
+#
+# Named here rather than cleaned up: killing something whose directory somebody
+# removed is a decision for the person who removed it.
+orphans() {
+  found=""
+  for p in $(pgrep -f "$out/mvm-boot" 2>/dev/null); do
+    owned=no
+    for d in "$MVM_HOME"/*/; do
+      [ -r "$d/vmm.pid" ] && [ "$(cat "$d/vmm.pid" 2>/dev/null)" = "$p" ] && owned=yes
+    done
+    [ "$owned" = no ] && found="$found $p"
+  done
+  for p in $(pgrep -f "$out/mproxy" 2>/dev/null); do
+    owned=no
+    for d in "$MVM_HOME"/*/; do
+      [ -r "$d/mproxy.pid" ] && [ "$(cat "$d/mproxy.pid" 2>/dev/null)" = "$p" ] && owned=yes
+    done
+    [ "$owned" = no ] && found="$found $p"
+  done
+  [ -n "$found" ] || return 0
+  echo "  orphans  $(echo $found | tr ' ' ',') -- running, and no machine in $MVM_HOME owns them"
+  echo "           (a state directory was removed while its machine was up; kill them by pid)"
+}
+
 status() {
   if running; then
     echo "mvm: $NAME running (pid $(cat "$D/vmm.pid"))"
@@ -332,6 +363,7 @@ status() {
     echo "mvm: $NAME is not running"
     [ -r "$D/disk.img" ] && echo "     its disk is still at $D/disk.img"
   fi
+  orphans
 }
 
 build() {
