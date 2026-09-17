@@ -28,6 +28,10 @@ extern fn hv_exit_pa: unit -> str;
 extern fn hv_advance_pc: unit -> int;
 extern fn hv_mask_vtimer: unit -> int;
 extern fn hv_set_sys: str -> str -> int;
+extern fn hv_vcpu_count: unit -> int;
+extern fn hv_cpu_on: int -> str -> str -> int;
+extern fn hv_cpu_on_wait: int -> str;
+extern fn hv_cpu_on_ctx: int -> str;
 extern fn now_ms: unit -> int;
 extern fn hv_now_secs: unit -> int;
 extern fn hv_start_deadline: int -> int;
@@ -107,6 +111,28 @@ let hex_val = fn (h: str) ->
 // Data abort from a lower exception level: the guest touched an address this
 // VMM has not mapped, which is how a device gets to exist.
 let ec_data_abort = 0x24;
+let ec_sysreg = 0x18;
+
+// A TRAPPED SYSTEM REGISTER. The framework hands some of them to the VMM, and
+// a machine that stops on the first one cannot boot a second CPU: Linux writes
+// OSDLR_EL1 -- the OS double lock -- while bringing one up, and that is the
+// one that stopped cpu1 here.
+//
+// What a VMM that models no debug hardware can honestly do: let a write go
+// nowhere, answer a read with zero, and move past the instruction. What it
+// must NOT do is that silently, so each distinct register is named the first
+// time it is seen. The number is the ISS's encoding, which is how the manual
+// names them: op0:op1:crn:crm:op2.
+let iss_sys_dir = fn (iss: int) -> bit_and iss 1;                    // 1 = read
+let iss_sys_rt = fn (iss: int) -> bit_and (bit_shr iss 5) 31;
+let iss_sys_key = fn (iss: int) -> bit_and iss 0x1fffffe;            // everything but Rt and dir
+let sys_name = fn (iss: int) ->
+  let op0 = bit_and (bit_shr iss 20) 3 in
+  let op2 = bit_and (bit_shr iss 17) 7 in
+  let op1 = bit_and (bit_shr iss 14) 7 in
+  let crn = bit_and (bit_shr iss 10) 15 in
+  let crm = bit_and (bit_shr iss 1) 15 in
+  "s" ++ show op0 ++ "_" ++ show op1 ++ "_c" ++ show crn ++ "_c" ++ show crm ++ "_" ++ show op2;
 let ec_hvc = 0x16;
 let ec_wfx = 0x01;
 let ec_sysreg = 0x18;
@@ -115,6 +141,127 @@ let ec_sysreg = 0x18;
 // bit 6 write.
 let iss_is_write = fn (iss: int) -> bit_and (bit_shr iss 6) 1 == 1;
 let iss_reg = fn (iss: int) -> bit_and (bit_shr iss 16) 31;
+
+// HOW MANY CPUS. The same name mkdtb reads, so a tree that says four and a
+// machine that runs one cannot happen.
+let vcpus = fn (u: unit) ->
+  let t = env_or "MVM_VCPUS" in
+  let v = (let n = str_len t in
+           if n == 0 then 1
+           else
+             let rec go = fn (i: int) -> fn (acc: int) ->
+               if i == n then acc
+               else
+                 let c = ord (char_at t i) in
+                 if c < 48 || c > 57 then 0 - 1
+                 else go (i + 1) (acc * 10 + (c - 48)) in
+             let r = go 0 0 in
+             if r <= 0 then 1 else r) in
+  if v < 1 then 1 else if v > 64 then 64 else v;
+
+// A CPU THAT IS NOT THE FIRST ONE.
+//
+// It creates its own vCPU, because the framework says so -- "Creates a vCPU
+// instance for the current thread", "Must be called by the owning thread" --
+// and then waits to be told where to start. Only the guest knows that: Linux
+// brings a secondary up with PSCI CPU_ON, and the CPU that makes that call
+// cannot set this one's registers, again because of the same rule. So the
+// entry point crosses through the shim and this thread sets its own pc.
+//
+// WHAT THIS LOOP DOES NOT DO is answer for a device. The device state is two
+// Mere Vecs, and a Vec cannot cross a thread boundary -- the compiler says so
+// in those words. Until that is solved a secondary that touches a device is
+// reported rather than served, which is enough to see it start and not enough
+// to let it run Linux.
+let secondary = fn (i: int) ->
+  let _ = must "hv_vcpu_create (secondary)" (hv_vcpu_new ()) in
+  // The framework places this vCPU's redistributor from its affinity, so the
+  // MPIDR has to be right before the redistributor exists. Bit 31 is RES1.
+  let _ = must "set MPIDR_EL1" (hv_set_sys "MPIDR_EL1" (hexs (2147483648 + i))) in
+  let entry = hv_cpu_on_wait i in
+  let ctx = hv_cpu_on_ctx i in
+  let _ = print_err ("mvm: cpu" ++ show i ++ " was told to start at " ++ entry
+                  ++ " with x0=" ++ ctx) in
+  let _ = must "set cpsr" (hv_set_cpsr "0x3c5") in
+  let _ = must "x0" (hv_set_x 0 ctx) in
+  let _ = must "set pc" (hv_set_pc entry) in
+  let rec go = fn (n: int) ->
+    if n > 4000000 then print_err ("mvm: cpu" ++ show i ++ " stopping after " ++ show n ++ " exits")
+    else
+      let rc = hv_run () in
+      if rc != 0 then print_err ("mvm: cpu" ++ show i ++ " hv_vcpu_run -> 0x" ++ hex rc)
+      else
+        let reason = hv_exit_reason () in
+        if reason == 0 then go (n + 1)
+        else if reason == 2 then let _ = hv_mask_vtimer () in go (n + 1)
+        else if reason != 1 then
+          print_err ("mvm: cpu" ++ show i ++ " exit reason " ++ show reason)
+        else
+          let ec = hv_exit_ec () in
+          if ec == ec_wfx then let _ = hv_advance_pc () in go (n + 1)
+          else if ec == ec_sysreg then
+            let iss = hv_exit_iss () in
+            let _ = print_err ("mvm: cpu" ++ show i ++ " "
+                            ++ (if iss_sys_dir iss == 1 then "read" else "wrote")
+                            ++ " " ++ sys_name iss ++ ", which this VMM does not model") in
+            let rt = iss_sys_rt iss in
+            let _ = if iss_sys_dir iss == 1 && rt != 31 then
+                      (let _ = hv_set_x rt "0x0" in ()) else () in
+            let _ = hv_advance_pc () in go (n + 1)
+          else if ec == ec_hvc then
+            let f = hex_val (hv_get_x 0) in
+            if f == 0x84000008 then print_err ("mvm: cpu" ++ show i ++ " asked for SYSTEM_OFF")
+            else
+              // A secondary can bring up another one; the table is shared.
+              let _ = if f == 0xc4000003 then
+                        (let t = hex_val (hv_get_x 1) in
+                         let r = hv_cpu_on (bit_and t 255) (hv_get_x 2) (hv_get_x 3) in
+                         let _ = hv_set_x 0 (if r == 0 then "0x0" else hexs r) in ())
+                      else (let _ = hv_set_x 0 "0xfffffffffffffffe" in ()) in
+              go (n + 1)
+          else if ec == ec_data_abort then
+            // THE DEVICES WITH NO STATE, which a second CPU can answer for on
+            // its own thread: the console and the clock. A write to the PL011
+            // is a character and a read of it is zero; the RTC is computed
+            // from this machine's clock. Neither touches a Mere Vec, so
+            // neither needs the thread that owns one.
+            //
+            // The console is not a detail here. cpu1 stopped on 0x9000018 --
+            // the PL011's flag register, which the kernel polls before it
+            // writes a byte -- and cpu0 then waited for cpu1 for ever. A
+            // secondary that cannot print cannot boot.
+            let va = hex_val (hv_exit_pa ()) in
+            let iss = hv_exit_iss () in
+            if va >= uart_base && va < uart_base + 4096 then
+              let off = va - uart_base in
+              let _ = if iss_is_write iss then
+                        (if off == 0 then
+                           let c = bit_and (hex_val (hv_get_x (iss_reg iss))) 255 in
+                           print_no_nl (chr c)
+                         else ())
+                      else (let _ = hv_set_x (iss_reg iss) "0x0" in ()) in
+              let _ = hv_advance_pc () in go (n + 1)
+            else if va >= rtc_base && va < rtc_base + 4096 then
+              let _ = if iss_is_write iss then ()
+                      else
+                        let r = rtc_read (va - rtc_base) in
+                        let _ = hv_set_x (iss_reg iss) (hexs r) in () in
+              let _ = hv_advance_pc () in go (n + 1)
+            else
+              // vsock and virtio-blk. Their state is a Mere Vec and a Vec
+              // cannot cross a thread boundary, so this CPU cannot answer for
+              // them -- that is the piece the design calls (e), and until it
+              // is done a secondary that reaches one stops here rather than
+              // reading somebody else's memory.
+              let _ = print_err ("mvm: cpu" ++ show i ++ " reached a device this thread cannot answer"
+                              ++ " for (" ++ hv_exit_pa () ++ "); the device state belongs to cpu0") in
+              print_err ("mvm: cpu" ++ show i ++ " stopped")
+          else
+            let _ = print_err ("mvm: cpu" ++ show i ++ " took an exception this VMM does not answer"
+                            ++ " (ec 0x" ++ hex ec ++ " at " ++ hv_exit_pa ()
+                            ++ " pc " ++ hv_get_pc () ++ ")") in
+            print_err ("mvm: cpu" ++ show i ++ " stopped") in
+  go 0;
 
 let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str) ->
   let _ = must "hv_vm_create" (hv_up ()) in
@@ -137,6 +284,20 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
   let n2 = hv_load_file dtb dtb_gpa_hex in
   let _ = if n2 <= 0 then let _ = print_err "mvm: cannot load the device tree" in exit 1 else 0 in
   let _ = print_err ("mvm: kernel " ++ show n1 ++ " bytes, dtb " ++ show n2 ++ " bytes") in
+
+  // THE OTHER CPUS FIRST. Each creates its own vCPU and sets its own affinity,
+  // and the framework places a redistributor for each -- all of which has to
+  // have happened before the guest reads the device tree and looks for them.
+  // They then wait: a CPU nobody turns on waits for the life of the machine,
+  // which is what it should do.
+  let ncpu = vcpus () in
+  let _ = if ncpu > 1 then print_err ("mvm: " ++ show ncpu ++ " cpus") else () in
+  let rec others = fn (i: int) ->
+    if i >= ncpu then ()
+    else
+      let _ = detach (spawn (fn (u: unit) -> secondary i)) in
+      others (i + 1) in
+  let _ = others 1 in
 
   let _ = must "hv_vcpu_create" (hv_vcpu_new ()) in
   // The framework places this vCPU's GIC redistributor from its affinity, so
@@ -267,9 +428,34 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
               let _ = print_err ("mvm: guest called PSCI SYSTEM_OFF (host end asked "
                               ++ show (vs_polls_of vs) ++ " times)") in out
             else if f == 0x84000009 then let _ = print_err "mvm: guest called PSCI SYSTEM_RESET" in out
+            else if f == 0xc4000003 then
+              // CPU_ON. x1 is the target's MPIDR, x2 where to start it, x3
+              // what to put in its x0. This CPU cannot set those registers --
+              // "must be called by the owning thread" -- so it leaves them for
+              // the target's own thread to pick up.
+              let t = hex_val (hv_get_x 1) in
+              let r = hv_cpu_on (bit_and t 255) (hv_get_x 2) (hv_get_x 3) in
+              let _ = hv_set_x 0 (if r == 0 then "0x0" else hexs r) in
+              run (n + 1) out
+            else if f == 0x84000000 then
+              // PSCI_VERSION. The tree says arm,psci-1.0 and this is 1.0.
+              let _ = hv_set_x 0 "0x10000" in run (n + 1) out
             else
               let _ = hv_set_x 0 "0xfffffffffffffffe" in   // NOT_SUPPORTED
               run (n + 1) out
+          else if ec == ec_sysreg then
+            // See sys_name: a write goes nowhere, a read answers zero, and
+            // each distinct register is named once so that nothing is
+            // swallowed quietly.
+            let iss = hv_exit_iss () in
+            let _ = print_err ("mvm: cpu0 "
+                            ++ (if iss_sys_dir iss == 1 then "read" else "wrote")
+                            ++ " " ++ sys_name iss ++ ", which this VMM does not model") in
+            let rt = iss_sys_rt iss in
+            let _ = if iss_sys_dir iss == 1 && rt != 31 then
+                      (let _ = hv_set_x rt "0x0" in ()) else () in
+            let _ = hv_advance_pc () in
+            run (n + 1) out
           else if ec == ec_data_abort then
             // The PHYSICAL address. virtual_address is where the kernel
             // mapped the device in its own page tables; the device is at the

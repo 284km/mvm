@@ -15,6 +15,7 @@ import "fdt.mere";
 extern fn hv_up: unit -> int;
 extern fn hv_gic_dist_size: unit -> int;
 extern fn hv_gic_redist_size: unit -> int;
+extern fn hv_gic_redist_region_size: unit -> int;
 extern fn hv_now_secs: unit -> int;
 
 let ram_base    = 0x40000000;
@@ -41,7 +42,7 @@ let phandle_clk = 2;
 let rtc_base = 0x9010000;
 
 let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) ->
-            fn (initrd_start: int) -> fn (initrd_end: int) ->
+            fn (initrd_start: int) -> fn (initrd_end: int) -> fn (ncpu: int) ->
   let st = bytebuf_new 0 in
   let strs = bytebuf_new 0 in
   let bn = begin_node st in
@@ -79,15 +80,26 @@ let build = fn (bootargs: str) -> fn (dist_size: int) -> fn (redist_size: int) -
       let _ = pc "reg" [0, ram_base, ram_sz / 4294967296, bit_and ram_sz 0xffffffff] in
     let _ = en () in
 
+    // ONE NODE PER CPU, written as a loop rather than as a first one and the
+    // others: a tree with two literal nodes is a tree that has to be edited
+    // again for four. `reg` is the MPIDR's affinity level 0, which is the
+    // number the guest uses to name a CPU in PSCI CPU_ON.
     let _ = bn "cpus" in
       let _ = pu "#address-cells" 1 in
       let _ = pu "#size-cells" 0 in
-      let _ = bn "cpu@0" in
-        let _ = ps "device_type" "cpu" in
-        let _ = ps "compatible" "arm,armv8" in
-        let _ = pu "reg" 0 in
-        let _ = ps "enable-method" "psci" in
-      let _ = en () in
+      let rec cpu = fn (i: int) ->
+        if i == ncpu then ()
+        else
+          let _ = bn ("cpu@" ++ show i) in
+            let _ = ps "device_type" "cpu" in
+            let _ = ps "compatible" "arm,armv8" in
+            let _ = pu "reg" i in
+            // Every CPU including the first: the boot CPU is started by the
+            // VMM and the rest by PSCI, and the kernel reads this to know how.
+            let _ = ps "enable-method" "psci" in
+          let _ = en () in
+          cpu (i + 1) in
+      let _ = cpu 0 in
     let _ = en () in
 
     // The kernel calls PSCI through HVC, which lands in this VMM as an exit.
@@ -180,24 +192,59 @@ let bootargs_or = fn (dflt: str) ->
   // come from the same call on this machine, so they cannot disagree.
   base ++ " MVM_EPOCH=" ++ show (hv_now_secs ());
 
+// HOW MANY, and the same answer the VMM will give: one name, read in both
+// places, so a tree that says four and a machine that runs one cannot happen.
+let vcpus = fn (u: unit) ->
+  let t = match env_var "MVM_VCPUS" with | Some x -> x | None -> "" in
+  // A number, or one. int_of_str stops the program on anything else, and this
+  // came from a person's environment.
+  let v = (let n = str_len t in
+           if n == 0 then 1
+           else
+             let rec go = fn (i: int) -> fn (acc: int) ->
+               if i == n then acc
+               else
+                 let c = ord (char_at t i) in
+                 if c < 48 || c > 57 then 0 - 1
+                 else go (i + 1) (acc * 10 + (c - 48)) in
+             let r = go 0 0 in
+             if r <= 0 then 1 else r) in
+  if v < 1 then 1 else if v > 64 then 64 else v;
+
+// AS MANY REDISTRIBUTORS AS THERE ARE CPUS -- not the region the framework
+// reserves.
+//
+// The framework's region is 33,554,432 bytes (256 redistributors at 131,072
+// each), and writing THAT into the tree put the redistributors on top of the
+// UART: this machine's map is redistributors at 0x80a0000 and the PL011 at
+// 0x9000000, which is 16 MiB above, and 32 MiB swallows it. Every gate that
+// starts a machine went red at once.
+//
+// The tree describes what is THERE. One redistributor per CPU, which is the
+// old value exactly when there is one CPU. The room between 0x80a0000 and the
+// UART holds 123 of them, so the map does not need moving for any number this
+// is ever going to run.
+let redist_reg = fn (n: int) -> n * hv_gic_redist_size ();
+
 match args () with
 | [out, initrd_start, initrd_end] ->
     let _ = hv_up () in
     let ds = hv_gic_dist_size () in
-    let rs = hv_gic_redist_size () in
+    let rs = redist_reg (vcpus ()) in
     let _ = if ds <= 0 then let _ = print_err "mkdtb: no distributor size" in exit 1 else 0 in
     let b = build (bootargs_or "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 rdinit=/init")
-                  ds rs (int_of_str initrd_start) (int_of_str initrd_end) in
+                  ds rs (int_of_str initrd_start) (int_of_str initrd_end) (vcpus ()) in
     let _ = write_bytes out b in
     print_err ("mkdtb: wrote " ++ out ++ " with an initrd")
 | [out] ->
     // A VM has to exist before the framework will answer for its GIC.
     let _ = hv_up () in
     let ds = hv_gic_dist_size () in
-    let rs = hv_gic_redist_size () in
+    let rs = redist_reg (vcpus ()) in
     let _ = if ds <= 0 then let _ = print_err "mkdtb: the framework would not give a distributor size" in exit 1 else 0 in
     let _ = if rs <= 0 then let _ = print_err "mkdtb: the framework would not give a redistributor size" in exit 1 else 0 in
-    let b = build (bootargs_or "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1") ds rs 0 0 in
+    let b = build (bootargs_or "earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1") ds rs 0 0 (vcpus ()) in
     let _ = write_bytes out b in
-    print_err ("mkdtb: wrote " ++ out ++ "  (gic dist 0x" ++ show ds ++ ", redist 0x" ++ show rs ++ ")")
+    print_err ("mkdtb: wrote " ++ out ++ "  (" ++ show (vcpus ()) ++ " cpu, gic dist 0x"
+            ++ show ds ++ ", redist region 0x" ++ show rs ++ ")")
 | _ -> let _ = print_err "usage: mkdtb <out.dtb>" in exit 2

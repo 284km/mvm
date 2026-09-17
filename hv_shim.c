@@ -27,8 +27,41 @@
 #include <poll.h>
 #include <signal.h>
 
-static hv_vcpu_t VCPU;
-static hv_vcpu_exit_t *EXIT;
+#include <pthread.h>   /* the registry below is written from several threads */
+
+/* ONE vCPU PER THREAD, because that is the framework's rule and not a choice:
+ *
+ *   hv_vcpu_create  "Creates a vCPU instance for the current thread"
+ *                   "Each thread can only have one vCPU associated at a time"
+ *   hv_vcpu_run     "Must be called by the owning thread"
+ *
+ * So these are thread-local, and every accessor below keeps the signature it
+ * had: "the vCPU" means "this thread's vCPU", which is exactly what the
+ * framework means by it. A second vCPU is a second thread calling
+ * hv_vcpu_new(), and nothing else here changes. */
+static _Thread_local hv_vcpu_t VCPU;
+static _Thread_local hv_vcpu_exit_t *EXIT;
+
+/* EXCEPT for the threads that own none. The deadline and the vsock watcher
+ * force a vCPU out of run() with hv_vcpus_exit, from outside; they cannot see
+ * a thread-local. So every handle is also registered here, written once at
+ * creation and read afterwards. */
+#define VCPU_MAX 64
+static hv_vcpu_t VCPU_ALL[VCPU_MAX];
+static volatile int VCPU_N;
+static pthread_mutex_t VCPU_REG = PTHREAD_MUTEX_INITIALIZER;
+
+/* Force every vCPU out of run(). Both callers want "somebody notice now": the
+ * deadline is stopping the machine, and the watcher has something for whoever
+ * is idle. Waking one that had nothing to do costs an exit. */
+static void vcpus_kick(void) {
+    pthread_mutex_lock(&VCPU_REG);
+    int n = VCPU_N;
+    hv_vcpu_t copy[VCPU_MAX];
+    for (int i = 0; i < n; i++) copy[i] = VCPU_ALL[i];
+    pthread_mutex_unlock(&VCPU_REG);
+    if (n > 0) hv_vcpus_exit(copy, (uint32_t)n);
+}
 static void *RAM;            /* the host mapping backing the guest's memory */
 static uint64_t RAM_GPA;
 static size_t RAM_SIZE;
@@ -40,6 +73,64 @@ static uint64_t hex64(const char *s) {
     return (uint64_t)strtoull(s, NULL, 16);
 }
 static const char *put64(uint64_t v) { snprintf(strbuf, sizeof strbuf, "0x%" PRIx64, v); return strbuf; }
+
+/* ---- PSCI CPU_ON: a rendezvous, in C -------------------------------------
+ *
+ * WHY HERE. Every register access "must be called by the owning thread", so
+ * the CPU that handles the HVC cannot set the target's pc -- it can only tell
+ * the target's own thread where to start. That message has to cross a thread
+ * boundary, and in Mere a Vec cannot: `cannot capture Vec['a, int Channel]
+ * across a thread boundary (it is neither Send nor Sync)`. A single channel
+ * can, but the handler needs to reach ONE OF N of them, which is a Vec.
+ *
+ * So the rendezvous lives where the VMM's other shared state already lives.
+ * Three integers per CPU, a mutex and a condition variable: the asking CPU
+ * leaves the entry point, the target's thread is woken and reads it.
+ *
+ * The entry point crosses the FFI as hex, like every other address here: that
+ * boundary's int is C's int and an address is not 32 bits.
+ */
+static pthread_mutex_t ON_M = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  ON_C = PTHREAD_COND_INITIALIZER;
+static uint64_t ON_ENTRY[VCPU_MAX];
+static uint64_t ON_CTX[VCPU_MAX];
+static int      ON_PENDING[VCPU_MAX];   /* 0 never asked, 1 asked, 2 running */
+
+/* PSCI_RET_SUCCESS 0, INVALID_PARAMS -2, ALREADY_ON -4. */
+int hv_cpu_on(int cpu, const char *entry_hex, const char *ctx_hex) {
+    if (cpu < 0 || cpu >= VCPU_MAX) return -2;
+    pthread_mutex_lock(&ON_M);
+    if (ON_PENDING[cpu] != 0) { pthread_mutex_unlock(&ON_M); return -4; }
+    ON_ENTRY[cpu] = hex64(entry_hex);
+    ON_CTX[cpu] = hex64(ctx_hex);
+    ON_PENDING[cpu] = 1;
+    pthread_cond_broadcast(&ON_C);
+    pthread_mutex_unlock(&ON_M);
+    return 0;
+}
+
+/* The target's own thread, waiting to be told. Blocks; returns the entry
+ * point. A secondary that is never asked for waits here for the life of the
+ * machine, which is what a CPU nobody turned on should do. */
+const char *hv_cpu_on_wait(int cpu) {
+    if (cpu < 0 || cpu >= VCPU_MAX) return put64(0);
+    pthread_mutex_lock(&ON_M);
+    while (ON_PENDING[cpu] != 1) pthread_cond_wait(&ON_C, &ON_M);
+    ON_PENDING[cpu] = 2;
+    uint64_t e = ON_ENTRY[cpu];
+    pthread_mutex_unlock(&ON_M);
+    return put64(e);
+}
+
+/* The context id the guest asked to be passed in x0. Read after the wait. */
+const char *hv_cpu_on_ctx(int cpu) {
+    if (cpu < 0 || cpu >= VCPU_MAX) return put64(0);
+    pthread_mutex_lock(&ON_M);
+    uint64_t c = ON_CTX[cpu];
+    pthread_mutex_unlock(&ON_M);
+    return put64(c);
+}
+
 
 /* Create the VM. 0 on success, the hv_return_t otherwise -- the number Apple's
  * header documents, not a -1 that loses which of eight things went wrong. */
@@ -84,7 +175,17 @@ int hv_peek32(const char *gpa_hex) {
     uint32_t v; memcpy(&v, p, 4); return (int)v;
 }
 
-int hv_vcpu_new(void) { return (int)hv_vcpu_create(&VCPU, &EXIT, NULL); }
+int hv_vcpu_new(void) {
+    hv_return_t r = hv_vcpu_create(&VCPU, &EXIT, NULL);
+    if (r != HV_SUCCESS) return (int)r;
+    pthread_mutex_lock(&VCPU_REG);
+    if (VCPU_N < VCPU_MAX) VCPU_ALL[VCPU_N++] = VCPU;
+    pthread_mutex_unlock(&VCPU_REG);
+    return 0;
+}
+
+/* How many there are, for whoever wants to say so. */
+int hv_vcpu_count(void) { return VCPU_N; }
 
 /* Registers by NUMBER: 0-30 are X0-X30, and PC and CPSR have their own calls,
  * because their enum values are not in that range and inventing a numbering
@@ -323,8 +424,7 @@ static void *deadline_thread(void *arg) {
     struct timespec ts = { DEADLINE_MS / 1000, (long)(DEADLINE_MS % 1000) * 1000000L };
     nanosleep(&ts, NULL);
     DEADLINE_FIRED = 1;
-    hv_vcpu_t v = VCPU;
-    hv_vcpus_exit(&v, 1);
+    vcpus_kick();
     return NULL;
 }
 
@@ -717,8 +817,9 @@ static void *vs_watch_thread(void *arg) {
             continue;
         }
         if (poll(pf, (nfds_t)n, 20) > 0) {
-            hv_vcpu_t v = VCPU;
-            hv_vcpus_exit(&v, 1);
+            /* Every vCPU, not "the" vCPU: this thread owns none, and the one
+             * that was idle is the one worth waking. */
+            vcpus_kick();
             /* Whatever it was stays readable until the vCPU's thread takes it,
              * so without a pause this spins on the same readiness. */
             struct timespec ts = { 0, 2 * 1000 * 1000L }; nanosleep(&ts, NULL);
