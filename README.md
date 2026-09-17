@@ -419,9 +419,18 @@ environment variable already, so the work was a check rather than a change —
 `test/two.sh`. **`docker build`** was listed as absent; it builds, caches, and
 writes one layer per step now.
 
-What is actually left is in the design notes: a single command to bring a
-machine up (today it is six pieces assembled by hand), and outbound NAT, which
-is not an omission but a request with no meaning on a machine that has no
+*Two more have happened since.* **A single command to bring a machine up** was
+listed here as the thing that was left; it is `tools/mvm`, and it now also
+builds what a machine is made of and brings the way out with it. **The kernel**
+was the piece a Mac alone could not obtain — `mvm build --kernel` takes it out
+of a pinned package, and produces the same bytes the checks here have always
+run against.
+
+What is actually left is one choice and one refusal. The choice: **building the
+kernel rather than unpacking somebody's**, which is worth having because the
+modules that exist decide what the machine can do — the measurement that sets
+it up is in the header of `tools/mkkernel.sh`. The refusal: **outbound NAT**,
+which is not an omission but a request with no meaning on a machine that has no
 upstream interface.
 
 The language change this project expected never arrived. `Raw`, Mere's window

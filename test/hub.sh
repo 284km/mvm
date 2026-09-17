@@ -71,6 +71,11 @@ chmod 755 "$out/extra-hub/mengd" "$out/extra-hub/mrun" "$out/extra-hub/mfwd"
 [ -x "$out/extra-hub/mengd" ] && [ -x "$out/mproxy" ]; say $? "everything builds, with TLS"
 
 echo "== the machine =="
+# ON THE WAY OUT, NOT AT THE END. The kill at the bottom of this script only
+# runs if the script reaches the bottom: one interrupted run left a proxy
+# listening on 3128 for eleven hours, and the next machine that started found a
+# stranger on the port it wanted.
+trap 'kill "${PXPID:-}" "${VMPID:-}" 2>/dev/null' EXIT INT TERM
 MPROXY_TRACE=1 "$out/mproxy" 3128 > "$out/mproxy.log" 2>&1 &
 PXPID=$!
 sleep 1

@@ -132,7 +132,12 @@ r=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
 echo "== removing them takes their processes =="
 for n in $(docker ps -aq 2>/dev/null); do docker rm -f "$n" >/dev/null 2>&1; done
 left=$(docker ps -aq 2>/dev/null | wc -l | tr -d ' ')
-[ "$left" = 0 ]; say $? "nothing left ($left)"
+# WHICH ones, not how many. A count cannot be acted on: two containers left out
+# of forty is a different fact depending on whether they are the ones this
+# check made, ones a --rm has not finished removing, or ones whose mount would
+# not come off -- and the daemon says the last of those out loud.
+[ "$left" = 0 ]
+say $? "nothing left ($left$([ "$left" = 0 ] || echo ": $(docker ps -a --format '{{.Names}}/{{.Status}}' 2>/dev/null | tr '\n' ' ')"))"
 
 # AND THE IMAGE IS STILL THERE. Every container's rootfs is an overlay whose
 # lower is the image's one unpacked copy, so this is the check that it is still
