@@ -184,11 +184,28 @@ grep -q "mproxy: dl-cdn.alpinelinux.org:443" "$out/mproxy.log"
 say $? "the package mirror was reached through the proxy, not some other way"
 fi
 
-# What the proxy will NOT do, and says so. busybox's wget has no CONNECT: it
-# asks the proxy to fetch, which for https would mean this end doing the TLS
-# and the caller verifying nothing.
+# WHAT THE PROXY DOES AND WHAT IT WILL NOT DO, which are two different lines
+# now. It used to refuse both: a plain GET and an absolute https URL got the
+# same 405. That was one decision too wide -- the reason is that terminating
+# TLS here would leave the caller verifying nothing, and plain http has no TLS
+# to terminate. busybox's wget, which is the wget in almost every alpine image,
+# has no CONNECT at all and asks for exactly that.
 wo=$(curl -s -x http://127.0.0.1:3128 http://example.com/ 2>&1 | head -1)
-case "$wo" in *"does not fetch on your behalf"*) echo "  ok    and a client that asks it to fetch is told why not";;                *) echo "  FAIL  got: $wo"; fail=1;; esac
+case "$wo" in
+  *"Example Domain"*) echo "  ok    it fetches plain http on a client's behalf";;
+  *) echo "  FAIL  plain http through the proxy got: $(echo "$wo" | head -c 100)"; fail=1;;
+esac
+# THE REFUSAL THAT MUST NOT GO AWAY. An absolute https:// URL is a request for
+# this end to do the handshake, and it is answered with the reason.
+# Sent raw, because getting curl to put an absolute https URL in a request
+# line without CONNECT is a fight with curl rather than a question for the
+# proxy. Two lines and a blank one is the whole of HTTP here.
+ws=$(printf 'GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n' \
+       | nc 127.0.0.1 3128 2>/dev/null | tail -1)
+case "$ws" in
+  *"will not terminate TLS"*) echo "  ok    and refuses to do the TLS for one, saying why";;
+  *) echo "  FAIL  an https fetch was not refused: $(echo "$ws" | head -c 100)"; fail=1;;
+esac
 
 kill "$VMPID" 2>/dev/null; wait "$VMPID" 2>/dev/null
 kill "$PXPID" 2>/dev/null; wait "$PXPID" 2>/dev/null

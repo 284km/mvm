@@ -361,12 +361,13 @@ int hv_now_secs(void) { return (int)time(NULL); }
  * one open for the life of every connection through it, and `docker compose
  * up` with published ports has several at once.
  *
- * 256 because 32 was a ceiling a real burst reached: forty `docker run` at
- * once filled it, this function then stopped accepting, the backlog behind it
- * filled, and eleven clients were told the daemon was not running. Must match
- * vs_smax in vsock.mere -- the table is the same table, counted on both
+ * 1024, measured twice: 32 was reached by forty `docker run` at once (eleven
+ * clients told the daemon was not running), and 256 by eighty (ten containers
+ * that never started). A run opens about four connections and they wait while
+ * the daemon serves thirty-two at a time, so this holds what is WAITING. Must
+ * match vs_smax in vsock.mere -- the table is the same table, counted on both
  * sides. */
-#define VS_MAX 256
+#define VS_MAX 1024
 static int VS_FD[VS_MAX];
 /* "The peer will send no more." Not the same as "the connection is over":
  * a host program that closes its write side is still waiting to READ, and

@@ -628,6 +628,30 @@ signature, including one that runs perfectly.)
 `test/build.sh` is the check, and its last section is the point: it takes
 docker off the `PATH` and starts a machine.
 
+## Packaging one
+
+```
+sh tools/mvm package        # -> .build/dist/mvm-<date>-<rev>-macos-arm64.tar.gz
+sh test/all.sh              # every gate, one answer
+```
+
+**28 MB**, and what is not in it is the point: no `guest/`, no `extra/`. The
+daemon, the runtime and the modules travel inside `initrd-format.gz`, which is
+what installs them into a machine on its first boot, so a release that also
+carried them beside it would carry them twice. It refuses to package a machine
+that `doctor` does not like, and it unpacks its own archive afterwards to check
+that the entitlement survived — a signature that did not travel is a release
+that fails on somebody else's machine and nowhere here.
+
+`test/all.sh` runs the gates cheapest-first and names every one that went red;
+`QUICK=1` stops before the ones that boot a machine. It earned its keep on the
+first run: `test/run.sh` — the P5.1 milestone, one commit, never touched — had
+been failing silently for months. `hv_map` took an `int` for the size when it
+was written, and grew a `str` when a guest went past 2 GiB; `boot.mere` was
+updated and `mvm.mere` was not. An `extern` declaration is a **promise** about
+the C, not a check of it, so the int was read as a pointer and the program
+segfaulted with nothing printed for as long as nobody ran it.
+
 ## Starting one
 
 ```

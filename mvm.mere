@@ -11,7 +11,13 @@
 // that looks like the hypervisor refusing a valid mapping.
 
 extern fn hv_up: unit -> int;
-extern fn hv_map: str -> int -> int;
+// str -> str, not str -> int. The size crosses the FFI boundary as hex for the
+// same reason the address does: that boundary's int is C's int, and a guest
+// with 4 GiB does not fit in one. It changed in hv_shim.c when a guest grew
+// past 2 GiB, and this declaration -- which is a PROMISE about the C, not a
+// check of it -- kept saying int. The int was then read as a pointer, and this
+// program segfaulted with nothing printed for as long as nobody ran it.
+extern fn hv_map: str -> str -> int;
 extern fn hv_poke32: str -> int -> int;
 extern fn hv_peek32: str -> int;
 extern fn hv_vcpu_new: unit -> int;
@@ -32,7 +38,7 @@ let hex_of_int = fn (v: int) ->
   if v == 0 then "0" else go v "";
 
 let ram_base = "0x40000000";
-let ram_size = 2097152;          // 2 MiB is plenty for two instructions
+let ram_size = "0x200000";       // 2 MiB is plenty for two instructions
 
 // A hv_return_t of 0 is success; anything else is one of Apple's documented
 // codes and is reported as itself rather than folded into "failed".

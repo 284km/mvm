@@ -7,6 +7,7 @@
 # and a docker client pointed at the right socket.
 #
 #   mvm build [--kernel [--from-source]]
+#   mvm package
 #   mvm start [--name N] [--disk-size MiB] [--ram MB] [-p HOST:GUEST]...
 #             [--proxy-port P | --no-proxy]
 #   mvm stop  [--name N]
@@ -20,6 +21,11 @@
 set -u
 here="$(cd "$(dirname "$0")/.." && pwd)"
 out="$here/.build"
+# A RELEASE HAS THEM AT THE TOP. In a checkout everything is built into
+# .build; in an unpacked tarball there is no build directory and the Image is
+# right there. The same tool runs from both, and the difference is one line
+# rather than a second script that would have to be kept in step.
+[ -r "$here/Image" ] && out="$here"
 MVM_HOME="${MVM_HOME:-$HOME/.mvm}"
 NAME=default
 DISK_MB=20480
@@ -72,19 +78,24 @@ CTL="$D/control.sock"
 # WHAT THIS MACHINE NEEDS, each named. A missing kernel and a missing module
 # are different sentences, and "it did not start" is neither of them.
 # Where a guest binary is: built here, or in the checkout it came from.
-guest_bin() {
-  case "$1" in
-    mengd) [ -x "$out/guest/mengd" ] && { echo "$out/guest/mengd"; return; }
-           echo "${MENGD_SRC:-}/.build/mengd-linux";;
-    mrun)  [ -x "$out/guest/mrun" ] && { echo "$out/guest/mrun"; return; }
-           echo "${MRUN_SRC:-}/.build/mrun-linux";;
-    mfwd)  [ -x "$out/guest/mfwd" ] && { echo "$out/guest/mfwd"; return; }
-           echo "$out/mfwd-linux";;
-  esac
+# WHAT THE INITRAMFS CARRIES.
+#
+# The guest's programs and the kernel's modules used to be checked as files in
+# .build, which was right while the disk was built here and copied them in.
+# They travel inside initrd-format.gz now, and the machine takes them from
+# there -- so a release does not contain .build/guest or .build/extra at all,
+# and a doctor that looked for them would report a working release broken.
+#
+# Listed once: the archive is 10 MB and decompressing it per question is four
+# times the work for the same answer.
+ird_list() {
+  [ -r "$out/initrd-format.gz" ] || return 0
+  gzip -dc "$out/initrd-format.gz" 2>/dev/null | cpio -t 2>/dev/null
 }
 
 doctor() {
   rc=0
+  IRD="$(ird_list)"
   chk() { if [ -r "$2" ] || [ -x "$2" ]; then echo "  ok    $1"; else echo "  MISSING $1 -- $3"; rc=1; fi; }
   echo "== what a machine is made of =="
   chk "an arm64 kernel Image"      "$out/Image"     "gunzip -c /boot/vmlinuz-\$(uname -r) > .build/Image, on a Linux box with that kernel"
@@ -98,18 +109,18 @@ doctor() {
   # kernel.lock, because the difference is a property of how the Image was
   # made: one taken out of a package is built for somebody else's machine and
   # has these as modules; one built here has them in it.
+  inird() { if echo "$IRD" | grep -qx "payload/$1"; then echo "  ok    $2"; else echo "  MISSING $2 -- sh tools/mkbuild.sh"; rc=1; fi; }
   if [ "$(awk '/^modules /{print $2}' "$out/kernel.lock" 2>/dev/null)" = built-in ]; then
     echo "  ok    the kernel has overlay, vsock, bridge and veth built in (no modules to ship)"
   else
-    for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport overlay veth bridge stp llc; do
-      chk "module $m.ko" "$out/extra/$m.ko" "from /lib/modules/\$(uname -r) of THAT kernel; each one missing costs a feature"
-    done
+    n=$(echo "$IRD" | grep -c "^payload/opt/.*\.ko$")
+    if [ "$n" = 8 ]; then echo "  ok    eight kernel modules, in the initramfs"
+    else echo "  MISSING kernel modules -- the initramfs carries $n of 8; sh tools/mvm build --kernel then sh tools/mkbuild.sh"; rc=1; fi
   fi
-  # THIS DIRECTORY FIRST. `mvm build` puts them in .build/guest, so a machine
-  # can be started from here alone; a checkout next door is how they get built,
-  # not how they get used.
-  chk "the daemon for the guest"   "$(guest_bin mengd)" "sh tools/mkbuild.sh (or set MENGD_SRC and build it for linux/arm64)"
-  chk "the runtime for the guest"  "$(guest_bin mrun)"  "sh tools/mkbuild.sh (or set MRUN_SRC and build it for linux/arm64)"
+  inird "opt/mengd"          "the daemon for the guest"
+  inird "opt/mrun"           "the runtime for the guest"
+  inird "opt/mfwd"           "the forwarder for the guest"
+  inird "init-mengd-disk"    "the init the machine boots"
   # WHICH kernel, not just that there is one. Two machines with the same tool
   # and different kernels behave differently, and the difference is invisible
   # until something a module provides is missing.
@@ -338,6 +349,7 @@ build() {
 
 case "$cmd" in
   build) build;;
+  package) sh "$here/tools/mkpackage.sh";;
   start) start;;
   stop) stop;;
   status) status;;

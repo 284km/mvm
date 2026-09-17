@@ -73,16 +73,21 @@ let vs_isr_reads = 23;   // how many times the guest has read this device's ISR
 let vs_polls = 24;       // how many times the host end has been asked
 let vs_next_hport = 25;  // this end's port for the next inward stream
 let vs_in_port = 26;     // non-zero once anything is listening inward
-// 256, not 32. The table is the ceiling on how many streams can be OPEN AT
-// ONCE, and a burst of clients is exactly that: forty `docker run` at the same
-// moment filled it, the accept loop then stopped taking connections, the
-// listening socket's backlog filled behind it, and eleven of the forty were
-// told "Cannot connect to the Docker daemon" -- which is true and names the
-// wrong machine.
+// 1024, and it got here by being measured twice.
+//
+// 32 was the first ceiling: forty `docker run` at the same moment filled it,
+// the accept loop stopped taking connections, the listening socket's backlog
+// filled behind it, and eleven of the forty were told "Cannot connect to the
+// Docker daemon" -- which is true and names the wrong machine. 256 held forty.
+// Eighty filled that too: a `docker run` opens about four connections and they
+// all wait while the daemon serves thirty-two requests at a time, so the table
+// has to hold what is WAITING, not what is being served.
 //
 // Back pressure belongs in the daemon, where a request that waits is a request
 // that waits. Here it turns into a refused connection, which is a failure.
-let vs_sfirst = 27; let vs_sstride = 8; let vs_smax = 256;
+// A stream costs nine integers and a descriptor, and this machine's descriptor
+// limit is a million, so the number is not bought with anything.
+let vs_sfirst = 27; let vs_sstride = 9; let vs_smax = 1024;
 // One slot after the table: how many inward connections were refused while it
 // was full. Written in terms of the constants above rather than spelled again
 // -- the previous spelling was `27 + 32 * 8`, which is a second place to
@@ -98,6 +103,11 @@ let vs_state_n = vs_refused_all + 1;
 // REQUEST this end sent, or open.
 let s_handle = 0; let s_gport = 1; let s_hport = 2; let s_fwd = 3;
 let s_sent = 4; let s_alloc = 5; let s_pfwd = 6; let s_st = 7;
+// How many times this end has tried to tell the guest a connection is waiting
+// and found nowhere to put the message. 0 once it has been told. A field of
+// its own rather than borrowing s_sent, which means something else the moment
+// the stream opens.
+let s_req = 8;
 let st_free = 0; let st_waiting = 1; let st_open = 2;
 
 let sf = fn (i: int) -> fn (f: int) -> vs_sfirst + i * vs_sstride + f;
@@ -220,9 +230,17 @@ let vs_ctl_ports = fn (s) -> fn (src_port: int) -> fn (dst_port: int)
     // Named, not swallowed. "The guest posted no receive buffer" and "the
     // packet was sent and lost" look identical from the guest -- it waits --
     // and only this end can tell them apart.
-    let _ = print_err ("mvm: vsock could not send op " ++ show op
-                    ++ ": no rx buffer (qnum " ++ show (qget s q_rx q_num)
-                    ++ " ready " ++ show (qget s q_rx q_ready) ++ ")") in
+    //
+    // ONLY WHEN TRACING, now that a request that finds no room is retried
+    // rather than dropped: an empty queue is a moment during a burst, not an
+    // event, and eighty clients at once produced a hundred of these lines for
+    // a run in which nothing at all went wrong. What is still said out loud is
+    // the one that means something -- a stream given up on.
+    let _ = if vs_tracing () then
+              (let _ = print_err ("mvm: vsock could not send op " ++ show op
+                               ++ ": no rx buffer (qnum " ++ show (qget s q_rx q_num)
+                               ++ " ready " ++ show (qget s q_rx q_ready) ++ ")") in ())
+            else () in
     0 - 1
   else
     let tbl = qget s q_rx q_desc in
@@ -343,16 +361,24 @@ let vs_accept = fn (s) ->
         let _ = sset s i s_st st_waiting in
         let _ = print_err ("mvm: vsock inward stream, host port " ++ show hp
                         ++ " to guest port " ++ show gp) in
+        let _ = sset s i s_req 0 in
         if vs_ctl s i op_request 0 < 0 then
-          // The guest is not ready to be told anything -- its driver may not
-          // be up yet, which is the normal case for a host that connects
-          // early. Keeping the stream would hold a slot and an open host
-          // socket for a handshake that was never started; there are eight
-          // slots, so eight early connections would leave no room for the
-          // ninth, which is the one that would have worked. Let it go and let
-          // the host try again.
-          let _ = vs_release s i in
-          let _ = print_err "mvm: vsock dropped that inward stream; the guest was not ready" in 0
+          // KEPT AND RETRIED, not dropped.
+          //
+          // It used to be released here, and the reason was written when this
+          // table had EIGHT slots: eight early connections would leave no room
+          // for the ninth. It has 256 now, and the case that actually happens
+          // is not an early connection at all -- it is a BURST. Forty
+          // `docker run` at once opened 543 inward streams, and three of them
+          // found the guest's receive queue momentarily empty: no buffer to
+          // put the request in. Those three were dropped, and the client saw
+          // its POST end in EOF with the daemon never having heard of it.
+          //
+          // A queue that is empty for a moment is back pressure, not a guest
+          // that is not there. The stream waits and the request goes out on a
+          // later turn of the pump; a guest that really is not there still
+          // releases it, after the count below.
+          let _ = sset s i s_req 1 in 1
         else 1;
 
 // ---- the control socket ---------------------------------------------------
@@ -445,9 +471,34 @@ let vs_control = fn (s) ->
 // larger than one receive buffer is the normal case, and handing over one
 // buffer per wake-up makes the stream's speed a property of how often a thread
 // happens to poll.
+// The requests that had nowhere to go, tried again.
+//
+// About twelve seconds at the pump's rate before a stream is given up on,
+// which is long enough for a queue the guest is still refilling and short
+// enough that a host connecting to a machine with no driver up does not hold
+// its socket for ever.
+let vs_retry_requests = fn (s) ->
+  let rec go = fn (i: int) ->
+    if i == vs_smax then ()
+    else
+      let _ = if sget s i s_st == st_waiting && sget s i s_req > 0 then
+                (if vs_ctl s i op_request 0 >= 0 then
+                   (let _ = sset s i s_req 0 in ())
+                 else
+                   let n = sget s i s_req + 1 in
+                   if n > 600 then
+                     (let _ = print_err ("mvm: vsock gave up telling the guest about host port "
+                                      ++ show (sget s i s_hport) ++ "; it never had room")  in
+                      let _ = vs_release s i in ())
+                   else (let _ = sset s i s_req n in ()))
+              else () in
+      go (i + 1) in
+  go 0;
+
 let vs_pump = fn (s) ->
   let _ = vs_control s in
   let _ = vs_accept s in
+  let _ = vs_retry_requests s in
   let rec sweep = fn (i: int) -> fn (moved: int) ->
     if i == vs_smax then moved
     else

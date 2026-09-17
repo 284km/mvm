@@ -131,6 +131,38 @@ docker load -i "$out/build-alpine.tar" >/dev/null 2>&1; say $? "an image loads i
 o=$(docker run --rm alpine:latest echo made-without-docker 2>/dev/null | tr -d '\r\n')
 [ "$o" = "made-without-docker" ]; say $? "and a container runs on the disk the guest made ($o)"
 
+echo "== and the thing a person actually downloads =="
+# EVERYTHING ABOVE IS ABOUT A CHECKOUT. This unpacks the archive somewhere
+# else and starts a machine from it, with docker off the PATH -- which is the
+# only way to know that what goes in the tarball is what a machine needs. The
+# first version of the archive was complete and unusable: the tool looks in
+# .build, and a release has no build directory.
+sh "$here/tools/mvm" package > "$out/build-pkg.log" 2>&1
+say $? "mvm package"
+arch=$(ls -t "$out"/dist/*.tar.gz 2>/dev/null | head -1)
+[ -n "$arch" ]; say $? "an archive ($(wc -c < "$arch" 2>/dev/null | tr -d ' ') bytes)"
+# .build/guest and .build/extra are NOT in it: the guest's programs and the
+# modules travel inside the initramfs, and a release that carried both would
+# carry them twice.
+tar tzf "$arch" 2>/dev/null | grep -qE "(guest|extra)/"; [ $? != 0 ]
+say $? "and it does not carry the guest's programs twice"
+T="$out/relcheck"; rm -rf "$T"; mkdir -p "$T"
+tar xzf "$arch" -C "$T"
+R=$(ls -d "$T"/mvm-* 2>/dev/null | head -1)
+[ -n "$R" ] && [ -r "$R/INSTALL" ]; say $? "it unpacks, with something that says how to use it"
+( cd "$R" && sh tools/mvm doctor >/dev/null 2>&1 ); say $? "doctor is green inside the unpacked archive"
+RM="rel$$"
+env PATH=/usr/bin:/bin:/usr/sbin:/sbin MVM_HOME="$MVM_HOME" \
+    sh "$R/tools/mvm" start --name "$RM" --disk-size 1024 > "$out/build-rel.log" 2>&1
+say $? "and a machine starts from it, with docker off the PATH"
+o=$(DOCKER_HOST="unix://$MVM_HOME/$RM/docker.sock" DOCKER_CONTEXT= sh -c '
+  DOCKER_HOST= docker save alpine:latest -o '"$out"'/build-rel.tar 2>/dev/null
+  docker load -i '"$out"'/build-rel.tar >/dev/null 2>&1
+  docker run --rm alpine:latest echo from-a-tarball 2>/dev/null' | tr -d '\r\n')
+[ "$o" = "from-a-tarball" ]; say $? "and runs a container ($o)"
+sh "$R/tools/mvm" stop --name "$RM" >/dev/null 2>&1
+rm -rf "$MVM_HOME/$RM" "$T"; docker context rm "mvm-$RM" >/dev/null 2>&1
+
 echo "== starting it again costs nothing =="
 # The initramfs is built from a pipe, so gzip stores no timestamp and the same
 # inputs give the same bytes. That is what makes 'has this tool changed' a

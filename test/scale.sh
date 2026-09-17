@@ -34,7 +34,21 @@ case "$(uname -sm)" in "Darwin arm64") ;; *) echo "needs macOS on Apple silicon"
 command -v docker >/dev/null 2>&1 || { echo "needs a docker client as the oracle" >&2; exit 2; }
 [ -n "${MENGD_SRC:-}" ] && [ -n "${MRUN_SRC:-}" ] || { echo "set MENGD_SRC and MRUN_SRC" >&2; exit 2; }
 N="${1:-25}"
+# FORTY for the contract, EIGHTY for the transport -- two questions that were
+# one number and should not have been.
+#
+# "Does every container come up" is about this machine's capacity: one vCPU,
+# thirty-two request slots, and eighty simultaneous creates is past what it is
+# for. At eighty, 79 of 80 came up with no client error and no connection lost,
+# which is a measurement and not a broken promise.
+#
+# "Does the transport lose a connection" is a promise, and it holds at any
+# size. Forty hid a real defect for weeks -- three streams in five hundred
+# dropped when the guest's receive queue was momentarily empty, two clients out
+# of forty and only sometimes -- so the promise is asked at eighty, where it
+# failed thirteen times out of eighty every run.
 BURST="${BURST:-40}"
+BIG="${BIG:-80}"
 fail=0
 say() { [ "$1" = 0 ] && echo "  ok    $2" || { echo "  FAIL  $2"; fail=1; }; }
 M="scale$$"
@@ -132,6 +146,35 @@ r=$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')
 [ "$r" = "$BURST" ]; say $? "all $BURST are running ($r) in $((t1 - t0)) ms"
 [ "$(inuse)" = 0 ]; say $? "and nothing is held afterwards ($(streams))"
 [ "$(refused)" = 0 ]; say $? "and nothing was refused ($(streams))"
+# A STREAM THE TRANSPORT LOST is not a stream the daemon refused, and the
+# clients see the difference as an EOF in the middle of a request rather than a
+# connection that would not open. The VMM says both; this asks for both.
+# wc -l, not grep -c: grep -c EXITS 1 when the count is zero, so the `|| echo 0`
+# after it ran as well and $d became two lines. The check then compared "0\n0"
+# against 0 and failed on a run where nothing had gone wrong.
+d=$(grep -a "dropped that inward stream\|gave up telling" "$V" 2>/dev/null | wc -l | tr -d ' ')
+[ "$d" = 0 ]; say $? "and the VMM dropped no inward stream ($d)"
+
+echo "== and the transport, at twice that =="
+# ONLY THE PROMISE IS ASSERTED HERE. The number that came up is printed,
+# because it is worth knowing and it is not a contract: see the comment on BIG.
+for n in $(docker ps -aq 2>/dev/null); do docker rm -f "$n" >/dev/null 2>&1; done
+sleep 2
+rm -rf "$out/scale-big"; mkdir -p "$out/scale-big"
+i=0
+while [ "$i" -lt "$BIG" ]; do
+  docker run -d --name g$i alpine:latest sh -c 'sleep 600' >/dev/null 2>"$out/scale-big/e.$i" &
+  i=$((i + 1))
+done
+wait
+sleep 3
+bad=0
+for e in "$out/scale-big"/e.*; do [ -s "$e" ] && bad=$((bad + 1)); done
+[ "$bad" = 0 ]; say $? "no client was refused a connection at $BIG ($bad)"
+[ "$(refused)" = 0 ]; say $? "the VMM refused nothing at $BIG ($(streams))"
+d=$(grep -a "dropped that inward stream\|gave up telling" "$V" 2>/dev/null | wc -l | tr -d ' ')
+[ "$d" = 0 ]; say $? "and lost no inward stream at $BIG ($d)"
+echo "  note  $(docker ps -q 2>/dev/null | wc -l | tr -d ' ') of $BIG came up -- reported, not required: one vCPU and 32 request slots"
 
 echo "== removing them takes their processes =="
 for n in $(docker ps -aq 2>/dev/null); do docker rm -f "$n" >/dev/null 2>&1; done
