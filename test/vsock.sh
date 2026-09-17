@@ -158,16 +158,27 @@ grep -qaE "\] userspace: init-vsock done[[:space:]]*$" "$pc"; say $? "so init st
 grep -qa "host saw" "$pc" && { echo "  FAIL  a reply arrived with no host to send it"; fail=1; } \
   || echo "  ok    and no reply arrived"
 
-echo "== poison: stop waking the vCPU for the host =="
+echo "== poison: let nothing look at the host end =="
 # The bug this reproduces was real and cost the first three runs: the loop
 # polled the host end only on exits it stopped receiving once the virtual timer
 # was masked -- 4 polls in 52,189 exits. Everything up to the guest's write
 # still worked, so a check that stopped at "the stream opened" was green.
+#
+# IT TAKES TWO CUTS NOW, and that is a change in the design rather than a
+# weakening of the check. The devices moved to a thread of their own, and that
+# thread looks at the host end on its own timeout as well as when it is woken.
+# So removing the wake-up alone no longer loses the reply -- it delays it --
+# and this poison said so: "the reply arrived anyway". What must still be true
+# is that SOMETHING looks, so the poison removes both: no wake-up, and a
+# timeout long enough to be no timeout at all.
 sed 's|let _ = hv_vs_wake () in|let _ = 0 in|' "$here/vsock.mere" > "$out/poison-vsock.mere"
 cmp -s "$here/vsock.mere" "$out/poison-vsock.mere" && { echo "  FAIL  the poison changed nothing"; fail=1; }
 cp "$here/virtio.mere" "$out/virtio.mere"
 cp "$here/boot.mere" "$out/poison-boot.mere"
 sed -i '' 's|import "vsock.mere";|import "poison-vsock.mere";|' "$out/poison-boot.mere"
+sed -i '' 's|let cpu = hv_dev_take 20 in|let cpu = hv_dev_take 3600000 in|' "$out/poison-boot.mere"
+grep -q "hv_dev_take 3600000" "$out/poison-boot.mere" \
+  || { echo "  FAIL  the second half of the poison did not apply"; fail=1; }
 if "$M" -c "$out/poison-boot.mere" > "$out/pb.c" 2>/dev/null \
    && cc -O2 -o "$out/mvm-poison" "$out/pb.c" "$here/hv_shim.c" -framework Hypervisor 2>/dev/null; then
   codesign --sign - --force --entitlements "$here/mvm.entitlements" "$out/mvm-poison" 2>/dev/null
@@ -182,7 +193,7 @@ if "$M" -c "$out/poison-boot.mere" > "$out/pb.c" 2>/dev/null \
   # The stream still opens and the guest still writes -- that is the point.
   grep -qa "^mvm: vsock outward stream, guest port" "$out/poison2-vmm.txt"; say $? "the stream still opens without the wake-up"
   grep -qa "HELLO FROM THE GUEST" "$out/poison2-console.txt" \
-    && { echo "  FAIL  the reply arrived anyway, so this gate does not depend on the wake-up"; fail=1; } \
+    && { echo "  FAIL  the reply arrived with nothing looking at the host end"; fail=1; } \
     || echo "  ok    but the reply never reaches the guest, and this gate sees it"
 else
   echo "  FAIL  the poisoned VMM did not build"; fail=1

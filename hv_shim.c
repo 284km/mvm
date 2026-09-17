@@ -74,6 +74,123 @@ static uint64_t hex64(const char *s) {
 }
 static const char *put64(uint64_t v) { snprintf(strbuf, sizeof strbuf, "0x%" PRIx64, v); return strbuf; }
 
+/* How many device accesses the guest has made. Counted to answer one question
+ * -- what a channel round trip per MMIO would cost -- and left because the
+ * number is worth knowing. */
+static volatile long long MMIO_N;
+int hv_bump_mmio(void) { MMIO_N++; return 0; }
+const char *hv_mmio_count(void) { return put64((uint64_t)MMIO_N); }
+
+/* ---- the device thread's post box ----------------------------------------
+ *
+ * WHY THE DEVICES NEED A THREAD OF THEIR OWN. virtio-mmio and vsock keep their
+ * state in Mere Vecs, and a Vec cannot cross a thread boundary -- the compiler
+ * refuses it in those words. With one vCPU that was free: the only thread that
+ * existed owned everything. With two, an MMIO exit can arrive on either, and
+ * only one of them can hold the state.
+ *
+ * So one thread owns the devices and the others ask it. The asking goes
+ * through here rather than through Mere's channels for the same reason CPU_ON
+ * does: a request has to reach ONE OF N reply paths, and a Vec of channels is
+ * refused. This is a mutex and two condition variables, which is what a
+ * channel is underneath anyway.
+ *
+ * WHAT IT COSTS, measured before it was written: 616 device accesses per
+ * docker command, and a round trip of a few microseconds -- about 2 ms on a
+ * command that takes 54. Boot makes 56,654 of them, which is the part that
+ * pays most.
+ *
+ * Values cross as hex, like every other wide value in this file: the FFI
+ * boundary's int is C's int, and a 32-bit register value with the top bit set
+ * is not a positive one.
+ */
+static pthread_mutex_t DEV_M = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  DEV_ASK = PTHREAD_COND_INITIALIZER;   /* a request arrived */
+static pthread_cond_t  DEV_ANS = PTHREAD_COND_INITIALIZER;   /* an answer is ready */
+static int      DEV_PENDING[VCPU_MAX];   /* 0 idle, 1 asked, 2 answered */
+static int      DEV_KIND[VCPU_MAX];      /* which device */
+static int      DEV_OFF[VCPU_MAX];
+static int      DEV_WRITE[VCPU_MAX];
+static uint64_t DEV_VAL[VCPU_MAX];       /* in: what to write. out: what was read */
+static volatile int DEV_STOP;
+static volatile int DEV_POKE;   /* the host end spoke; poll it now */
+
+/* A vCPU: leave the request, wait for the answer. Returns what was read. */
+const char *hv_dev_ask(int cpu, int kind, int off, const char *val_hex, int is_write) {
+    if (cpu < 0 || cpu >= VCPU_MAX) return put64(0);
+    pthread_mutex_lock(&DEV_M);
+    DEV_KIND[cpu] = kind; DEV_OFF[cpu] = off; DEV_WRITE[cpu] = is_write;
+    DEV_VAL[cpu] = hex64(val_hex);
+    DEV_PENDING[cpu] = 1;
+    pthread_cond_broadcast(&DEV_ASK);
+    while (DEV_PENDING[cpu] == 1 && !DEV_STOP) pthread_cond_wait(&DEV_ANS, &DEV_M);
+    uint64_t v = DEV_VAL[cpu];
+    DEV_PENDING[cpu] = 0;
+    pthread_mutex_unlock(&DEV_M);
+    return put64(v);
+}
+
+/* The device thread: which CPU is asking, or -1 when the wait timed out and
+ * -2 when the machine is stopping. A timeout is not an idle moment wasted --
+ * it is when the host end gets polled, which is work only this thread can do. */
+int hv_dev_take(int wait_ms) {
+    pthread_mutex_lock(&DEV_M);
+    for (;;) {
+        if (DEV_STOP) { pthread_mutex_unlock(&DEV_M); return -2; }
+        for (int i = 0; i < VCPU_MAX; i++)
+            if (DEV_PENDING[i] == 1) { pthread_mutex_unlock(&DEV_M); return i; }
+        if (DEV_POKE) { DEV_POKE = 0; pthread_mutex_unlock(&DEV_M); return -1; }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+        ts.tv_sec += wait_ms / 1000 + ts.tv_nsec / 1000000000L;
+        ts.tv_nsec %= 1000000000L;
+        int r = pthread_cond_timedwait(&DEV_ASK, &DEV_M, &ts);
+        if (r == ETIMEDOUT) { pthread_mutex_unlock(&DEV_M); return -1; }
+    }
+}
+
+int hv_dev_kind(int cpu)  { return (cpu >= 0 && cpu < VCPU_MAX) ? DEV_KIND[cpu] : 0; }
+int hv_dev_off(int cpu)   { return (cpu >= 0 && cpu < VCPU_MAX) ? DEV_OFF[cpu] : 0; }
+int hv_dev_write(int cpu) { return (cpu >= 0 && cpu < VCPU_MAX) ? DEV_WRITE[cpu] : 0; }
+const char *hv_dev_val(int cpu) { return put64((cpu >= 0 && cpu < VCPU_MAX) ? DEV_VAL[cpu] : 0); }
+
+int hv_dev_answer(int cpu, const char *val_hex) {
+    if (cpu < 0 || cpu >= VCPU_MAX) return -1;
+    pthread_mutex_lock(&DEV_M);
+    DEV_VAL[cpu] = hex64(val_hex);
+    DEV_PENDING[cpu] = 2;
+    pthread_cond_broadcast(&DEV_ANS);
+    pthread_mutex_unlock(&DEV_M);
+    return 0;
+}
+
+/* THE HOST END SPOKE. Called by the watcher: it means "poll now", and without
+ * it the only thing that would make this thread look is its own timeout --
+ * which is a ceiling on latency, not a schedule.
+ *
+ * This replaced pumping after every single access. Doing that cost 34 ms on a
+ * docker ps: 616 accesses each followed by a poll of every host socket, where
+ * the old code polled only when the guest went idle. */
+int hv_dev_poke(void) {
+    pthread_mutex_lock(&DEV_M);
+    DEV_POKE = 1;
+    pthread_cond_broadcast(&DEV_ASK);
+    pthread_mutex_unlock(&DEV_M);
+    return 0;
+}
+
+/* Everything stops. A vCPU waiting for an answer that will never come would
+ * otherwise hold the machine open. */
+int hv_dev_stop(void) {
+    pthread_mutex_lock(&DEV_M);
+    DEV_STOP = 1;
+    pthread_cond_broadcast(&DEV_ASK);
+    pthread_cond_broadcast(&DEV_ANS);
+    pthread_mutex_unlock(&DEV_M);
+    return 0;
+}
+
 /* ---- PSCI CPU_ON: a rendezvous, in C -------------------------------------
  *
  * WHY HERE. Every register access "must be called by the owning thread", so
@@ -817,8 +934,10 @@ static void *vs_watch_thread(void *arg) {
             continue;
         }
         if (poll(pf, (nfds_t)n, 20) > 0) {
-            /* Every vCPU, not "the" vCPU: this thread owns none, and the one
-             * that was idle is the one worth waking. */
+            /* The device thread first -- it is the one that can read the
+             * socket -- and then the vCPUs, because a guest in WFI has to come
+             * out to take the interrupt that follows. */
+            hv_dev_poke();
             vcpus_kick();
             /* Whatever it was stays readable until the vCPU's thread takes it,
              * so without a pause this spins on the same readiness. */

@@ -655,6 +655,50 @@ updated and `mvm.mere` was not. An `extern` declaration is a **promise** about
 the C, not a check of it, so the int was read as a pointer and the program
 segfaulted with nothing printed for as long as nobody ran it.
 
+## More than one CPU
+
+```
+sh tools/mvm start --cpus 4
+```
+
+**One by default, because more is not free.** The operations this is quickest
+at are round trips, not arithmetic: `docker ps` is 54 ms against Colima's 132
+on a single vCPU, and a second one does not touch that. What it buys is the
+case where something is busy next to something else — a web service beside a
+worker, which is what a compose file usually is:
+
+| workers running | 1 vCPU | 2 vCPU | 4 vCPU | Colima (6) |
+|---|---|---|---|---|
+| none | 100 ms | 101 ms | 99 ms | 109 ms |
+| one | **239 ms** | 97 ms | 104 ms | 111 ms |
+| three | **530 ms** | 269 ms | **100 ms** | 127 ms |
+
+The handler in that measurement uses the CPU. One that only waits on I/O is
+**not** slowed by a busy neighbour even on a single vCPU — measured at 45 ms
+with none and 45 ms with three — which is why the number that matters is this
+one and not a synthetic loop.
+
+**The framework decides the shape.** `hv_vcpu.h`: *"Creates a vCPU instance for
+the current thread"*, *"Each thread can only have one vCPU associated at a
+time"*, *"Must be called by the owning thread"*. So a vCPU is a thread, the
+handles are thread-local, and not one of the twelve register accessors changed
+its signature. The GIC is free as well: macOS emulates GICv3 and places a
+redistributor per vCPU from its affinity, and guest-to-guest IPIs are SGIs the
+framework handles without this VMM in the path. `PSCI CPU_ON` rendezvouses
+through the shim, because the CPU handling the call cannot set another's `pc`.
+
+**The devices got a thread of their own**, and that is the whole of the work.
+virtio-mmio and vsock keep their state in Mere Vecs, and a Vec cannot cross a
+thread boundary — the compiler says so in those words — so one thread holds
+them and the CPUs ask. Measured first: 616 device accesses per docker command,
+a few microseconds each. `docker ps` went from 54 ms to 62.
+
+It also polls the host end now, which used to be the idle guest's job — a vCPU
+pumped vsock on every WFI and a watcher forced it out of `run()`. That was one
+point of failure, and `test/vsock.sh` had a poison for it. The poison stopped
+biting: the device thread looks on its own timeout as well, so removing the
+wake-up delays the reply instead of losing it. The poison now removes both.
+
 ## Starting one
 
 ```

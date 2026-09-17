@@ -29,6 +29,17 @@ extern fn hv_advance_pc: unit -> int;
 extern fn hv_mask_vtimer: unit -> int;
 extern fn hv_set_sys: str -> str -> int;
 extern fn hv_vcpu_count: unit -> int;
+extern fn hv_bump_mmio: unit -> int;
+extern fn hv_dev_ask: int -> int -> int -> str -> int -> str;
+extern fn hv_dev_take: int -> int;
+extern fn hv_dev_kind: int -> int;
+extern fn hv_dev_off: int -> int;
+extern fn hv_dev_write: int -> int;
+extern fn hv_dev_val: int -> str;
+extern fn hv_dev_answer: int -> str -> int;
+extern fn hv_dev_stop: unit -> int;
+extern fn hv_dev_poke: unit -> int;
+extern fn hv_mmio_count: unit -> str;
 extern fn hv_cpu_on: int -> str -> str -> int;
 extern fn hv_cpu_on_wait: int -> str;
 extern fn hv_cpu_on_ctx: int -> str;
@@ -111,7 +122,6 @@ let hex_val = fn (h: str) ->
 // Data abort from a lower exception level: the guest touched an address this
 // VMM has not mapped, which is how a device gets to exist.
 let ec_data_abort = 0x24;
-let ec_sysreg = 0x18;
 
 // A TRAPPED SYSTEM REGISTER. The framework hands some of them to the VMM, and
 // a machine that stops on the first one cannot boot a second CPU: Linux writes
@@ -137,6 +147,23 @@ let ec_hvc = 0x16;
 let ec_wfx = 0x01;
 let ec_sysreg = 0x18;
 
+// Which device a request is for. Private to this file; the shim carries the
+// number without looking at it.
+let dev_vsock = 1;
+let dev_blk = 2;
+
+// ONE MMIO, ASKED OF WHOEVER OWNS THE DEVICE.
+//
+// Every vCPU goes through here, including the first. A fast path for cpu0 and
+// a slow one for the rest would be two ways for one thing to happen, and the
+// measurement said the uniform one is affordable: 616 device accesses per
+// docker command at a few microseconds each is about 2 ms on a command that
+// takes 54.
+let dev_read = fn (cpu: int) -> fn (kind: int) -> fn (off: int) ->
+  hex_val (hv_dev_ask cpu kind off "0x0" 0);
+let dev_write = fn (cpu: int) -> fn (kind: int) -> fn (off: int) -> fn (v: int) ->
+  let _ = hv_dev_ask cpu kind off (hexs v) 1 in ();
+
 // ISS layout for a data abort: bit 24 ISV, 23-22 size, 20-16 register,
 // bit 6 write.
 let iss_is_write = fn (iss: int) -> bit_and (bit_shr iss 6) 1 == 1;
@@ -158,6 +185,66 @@ let vcpus = fn (u: unit) ->
              let r = go 0 0 in
              if r <= 0 then 1 else r) in
   if v < 1 then 1 else if v > 64 then 64 else v;
+
+// THE THREAD THAT OWNS THE DEVICES.
+//
+// virtio-mmio and vsock keep their state in Mere Vecs, and a Vec cannot cross
+// a thread boundary: the compiler says so in those words. With one vCPU that
+// cost nothing, because the only thread there was owned everything. With two,
+// an MMIO exit arrives on whichever CPU took it, and only one thread can hold
+// the state -- so it is held here and the CPUs ask for it.
+//
+// IT ALSO POLLS THE HOST END. That used to be the idle guest's job: a vCPU
+// pumped vsock on every WFI, and a watcher forced it out of run() when the
+// host said something. The thread that owns the device is the better place --
+// it is awake when there is something to do rather than when the guest happens
+// to stop.
+let device_thread = fn (vspath: str) -> fn (inspec: str) -> fn (ctlpath: str) ->
+                    fn (dfltport: int) -> fn (disk: str) -> fn (disksec: int) ->
+  let dvs = vs_new () in
+  let dvio = vio_new () in
+  let rec listen_all = fn (spec: str) ->
+    if str_len spec == 0 then 0
+    else
+      let comma = str_index_of spec "," in
+      let one = if comma < 0 then spec else substring spec 0 comma in
+      let rest = if comma < 0 then "" else substring spec (comma + 1) (str_len spec) in
+      let eq = str_index_of one "=" in
+      let path = if eq < 0 then one else substring one 0 eq in
+      let port = if eq < 0 then dfltport else int_or (substring one (eq + 1) (str_len one)) dfltport in
+      let _ = vs_listen dvs path port in
+      listen_all rest in
+  let _ = listen_all inspec in
+  let _ = if str_len ctlpath > 0 then
+            (if hv_ctl_listen ctlpath == 0 then
+               (let _ = print_err ("mvm: control socket at " ++ ctlpath) in ())
+             else (let _ = print_err ("mvm: cannot open a control socket at " ++ ctlpath) in ()))
+          else () in
+  let rec loop = fn (u: unit) ->
+    // 20 ms is the longest this waits with nothing to do, and it is not the
+    // latency of anything: the watcher wakes this thread the moment the host
+    // end speaks.
+    let cpu = hv_dev_take 20 in
+    if cpu == 0 - 2 then ()
+    else if cpu == 0 - 1 then (let _ = vs_pump dvs in loop ())
+    else
+      let kind = hv_dev_kind cpu in
+      let off = hv_dev_off cpu in
+      let w = hv_dev_write cpu in
+      let v = hex_val (hv_dev_val cpu) in
+      let ans = if kind == dev_vsock then
+                  (if w == 1 then (let _ = vs_write dvs vspath off v in 0) else vs_read dvs off)
+                else
+                  (if w == 1 then (let _ = vio_write dvio off v disk in 0)
+                   else vio_read dvio off disksec) in
+      let _ = hv_dev_answer cpu (hexs ans) in
+      // AFTER A vsock ACCESS ONLY. Pumping after every access -- the block
+      // device included -- polls every host socket 616 times per docker
+      // command and cost 34 ms of a 54 ms one. A write to vsock's registers is
+      // the guest saying something; a read of the block device's is not.
+      let _ = if kind == dev_vsock && w == 1 then (let _ = vs_pump dvs in ()) else () in
+      loop () in
+  loop ();
 
 // A CPU THAT IS NOT THE FIRST ONE.
 //
@@ -247,14 +334,27 @@ let secondary = fn (i: int) ->
                         let r = rtc_read (va - rtc_base) in
                         let _ = hv_set_x (iss_reg iss) (hexs r) in () in
               let _ = hv_advance_pc () in go (n + 1)
+            else if va >= vs_base && va < vs_base + 0x200 then
+              let off = va - vs_base in
+              let _ = if iss_is_write iss then
+                        dev_write i dev_vsock off
+                          (bit_and (hex_val (hv_get_x (iss_reg iss))) 0xffffffff)
+                      else
+                        (let r = dev_read i dev_vsock off in
+                         let _ = hv_set_x (iss_reg iss) (hexs r) in ()) in
+              let _ = hv_advance_pc () in go (n + 1)
+            else if va >= vio_base && va < vio_base + 0x200 then
+              let off = va - vio_base in
+              let _ = if iss_is_write iss then
+                        dev_write i dev_blk off
+                          (bit_and (hex_val (hv_get_x (iss_reg iss))) 0xffffffff)
+                      else
+                        (let r = dev_read i dev_blk off in
+                         let _ = hv_set_x (iss_reg iss) (hexs r) in ()) in
+              let _ = hv_advance_pc () in go (n + 1)
             else
-              // vsock and virtio-blk. Their state is a Mere Vec and a Vec
-              // cannot cross a thread boundary, so this CPU cannot answer for
-              // them -- that is the piece the design calls (e), and until it
-              // is done a secondary that reaches one stops here rather than
-              // reading somebody else's memory.
-              let _ = print_err ("mvm: cpu" ++ show i ++ " reached a device this thread cannot answer"
-                              ++ " for (" ++ hv_exit_pa () ++ "); the device state belongs to cpu0") in
+              let _ = print_err ("mvm: cpu" ++ show i ++ " touched an address with no device ("
+                              ++ hv_exit_pa () ++ ")") in
               print_err ("mvm: cpu" ++ show i ++ " stopped")
           else
             let _ = print_err ("mvm: cpu" ++ show i ++ " took an exception this VMM does not answer"
@@ -321,42 +421,25 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
   // whatever program is listening on that socket. An empty one means the
   // device is still present -- the guest is told there is nothing listening,
   // which is a different answer from the device not being there at all.
-  let vs = vs_new () in
-  // Outward routes. MVM_VSOCK_OUT is a table -- "<guest port>=<address>,..." --
-  // and MVM_VSOCK is the older spelling of "one address, every port", which
-  // the vsock gate still uses.
+  //
+  // ALL OF IT LIVES ON ITS OWN THREAD NOW. See device_thread: the state is a
+  // Vec, a Vec cannot cross a thread boundary, and with more than one CPU an
+  // MMIO exit arrives on whichever CPU took it.
   let vspath = let t = env_or "MVM_VSOCK_OUT" in
                if str_len t > 0 then t else env_or "MVM_VSOCK" in
-  // MVM_VSOCK_IN is a list: "<path>=<guest port>,<path>=<guest port>". A bare
-  // path takes MVM_VSOCK_PORT, which is what one socket used to mean. Several
-  // exist because a docker socket and a forwarded port arrive the same way and
-  // are told apart by which guest port they reach.
   let dflt_port = int_or (env_or "MVM_VSOCK_PORT") 1024 in
-  let rec listen_all = fn (spec: str) ->
-    if str_len spec == 0 then 0
-    else
-      let comma = str_index_of spec "," in
-      let one = if comma < 0 then spec else substring spec 0 comma in
-      let rest = if comma < 0 then "" else substring spec (comma + 1) (str_len spec) in
-      let eq = str_index_of one "=" in
-      let path = if eq < 0 then one else substring one 0 eq in
-      let port = if eq < 0 then dflt_port else int_or (substring one (eq + 1) (str_len one)) dflt_port in
-      let _ = vs_listen vs path port in
-      listen_all rest in
-  let _ = listen_all (env_or "MVM_VSOCK_IN") in
-  // And a socket to ask for more. Ports published after the machine started
-  // cannot be named here, because nothing knows them yet.
   let ctlpath = env_or "MVM_CONTROL" in
-  let _ = if str_len ctlpath > 0 then
-            (if hv_ctl_listen ctlpath == 0 then
-               (let _ = print_err ("mvm: control socket at " ++ ctlpath) in ())
-             else (let _ = print_err ("mvm: cannot open a control socket at " ++ ctlpath) in ()))
-          else () in
-  let _ = if str_len vspath > 0 then print_err ("mvm: vsock outward " ++ vspath) else () in
+  let inspec = env_or "MVM_VSOCK_IN" in
   let disk_sectors = if str_len disk == 0 then 0 else file_size disk / 512 in
+  let _ = if str_len vspath > 0 then print_err ("mvm: vsock outward " ++ vspath) else () in
   let _ = if str_len disk > 0 then
             print_err ("mvm: disk " ++ disk ++ " (" ++ show disk_sectors ++ " sectors)")
           else () in
+  let _ = detach (spawn (fn (u: unit) ->
+            device_thread vspath inspec ctlpath dflt_port disk disk_sectors)) in
+  // The sockets have to be listening before anything connects to them, and
+  // before the guest is told this machine is running.
+  let _ = sleep_ms 50 in
   let _ = print_err "mvm: running" in
 
   // The loop. Every exit is either a device this VMM answers for, a PSCI call,
@@ -377,8 +460,7 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
                              if str_len t == 0 then 0 else int_or t 20000) in
   let rec run = fn (n: int) -> fn (out: int) ->
     if hv_deadline_fired () == 1 then
-      let _ = print_err ("mvm: gave up at the deadline after " ++ show n ++ " exits"
-                      ++ " (host end asked " ++ show (vs_polls_of vs) ++ " times)") in out
+      let _ = print_err ("mvm: gave up at the deadline after " ++ show n ++ " exits") in out
     else if n > 4000000 then
       let _ = print_err ("mvm: stopping after " ++ show n ++ " exits") in out
     else
@@ -391,23 +473,20 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
         // of run() gets here before the check at the top of the loop does, and
         // reporting it as an unknown exit reason names the wrong thing.
         let _ = if reason == 0 && hv_deadline_fired () == 1 then
-                  (let _ = print_err ("mvm: gave up at the deadline after " ++ show n
-                                   ++ " exits (host end asked " ++ show (vs_polls_of vs)
-                                   ++ " times)") in ())
+                  (let _ = print_err ("mvm: gave up at the deadline after " ++ show n ++ " exits") in ())
                 else () in
         if reason == 0 then
           // Something forced the vCPU out of run(). Either the deadline, or
           // the thread watching vsock's host end -- and those are opposite
           // answers, so the loop asks which before deciding to stop.
           (if hv_deadline_fired () == 1 then out
-           else let _ = vs_pump vs in run (n + 1) out)
+           else run (n + 1) out)
         else if reason == 2 then
           // The virtual timer is how an idle guest comes back, and an idle
           // guest is exactly when the host may have said something. WFI alone
           // is not enough: a guest blocked in read() sits in the framework's
           // run() and the only thing that returns from it is this.
           let _ = hv_mask_vtimer () in
-          let _ = vs_pump vs in
           run (n + 1) out
         else if reason != 1 then
           let _ = print_err ("mvm: exit reason " ++ show reason) in out
@@ -418,15 +497,14 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
             // something. Nothing else in this loop runs while the guest waits,
             // so a device whose other end is outside the VM has to be asked
             // here or it is never asked at all.
-            let _ = vs_pump vs in
             let _ = hv_advance_pc () in run (n + 1) out
           else if ec == ec_hvc then
             // PSCI. The function id is in x0; everything is answered
             // "not supported" for now except the ones that end the machine.
             let f = hex_val (hv_get_x 0) in
             if f == 0x84000008 then
-              let _ = print_err ("mvm: guest called PSCI SYSTEM_OFF (host end asked "
-                              ++ show (vs_polls_of vs) ++ " times)") in out
+              let _ = print_err ("mvm: guest called PSCI SYSTEM_OFF, "
+                              ++ hv_mmio_count () ++ " device accesses") in out
             else if f == 0x84000009 then let _ = print_err "mvm: guest called PSCI SYSTEM_RESET" in out
             else if f == 0xc4000003 then
               // CPU_ON. x1 is the target's MPIDR, x2 where to start it, x3
@@ -457,6 +535,7 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
             let _ = hv_advance_pc () in
             run (n + 1) out
           else if ec == ec_data_abort then
+            let _ = hv_bump_mmio () in
             // The PHYSICAL address. virtual_address is where the kernel
             // mapped the device in its own page tables; the device is at the
             // address the device tree named, and only the physical one says so.
@@ -466,11 +545,11 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
               (if va < vs_base + 0x200 then
                  let off = va - vs_base in
                  let _ = if iss_is_write iss then
-                           (let v = bit_and (hex_val (hv_get_x (iss_reg iss))) 0xffffffff in
-                            let _ = vs_write vs vspath off v in ())
+                           dev_write 0 dev_vsock off
+                             (bit_and (hex_val (hv_get_x (iss_reg iss))) 0xffffffff)
                          else
-                           let r = vs_read vs off in
-                           let _ = hv_set_x (iss_reg iss) (hexs r) in () in
+                           (let r = dev_read 0 dev_vsock off in
+                            let _ = hv_set_x (iss_reg iss) (hexs r) in ()) in
                  let _ = hv_advance_pc () in
                  run (n + 1) out
                else
@@ -479,11 +558,11 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
               (if va < vio_base + 0x200 then
                  let off = va - vio_base in
                  let _ = if iss_is_write iss then
-                           (let v = bit_and (hex_val (hv_get_x (iss_reg iss))) 0xffffffff in
-                            let _ = vio_write vio off v disk in ())
+                           dev_write 0 dev_blk off
+                             (bit_and (hex_val (hv_get_x (iss_reg iss))) 0xffffffff)
                          else
-                           let r = vio_read vio off disk_sectors in
-                           let _ = hv_set_x (iss_reg iss) (hexs r) in () in
+                           (let r = dev_read 0 dev_blk off in
+                            let _ = hv_set_x (iss_reg iss) (hexs r) in ()) in
                  let _ = hv_advance_pc () in
                  run (n + 1) out
                else

@@ -29,7 +29,7 @@ case "$(uname -sm)" in "Darwin arm64") ;; *) echo "needs macOS on Apple silicon"
 # from the directory: a file that appears in test/ is not automatically a gate,
 # and one that disappears should make this fail rather than quietly shrink.
 QUICK_GATES="run boot init vsock disk"
-VM_GATES="build stack two hub lifecycle app outward scale"
+VM_GATES="build stack two hub lifecycle app outward vcpus scale"
 gates="${ONLY:-}"
 if [ -z "$gates" ]; then
   if [ "${QUICK:-0}" = 1 ]; then gates="$QUICK_GATES"; else gates="$QUICK_GATES $VM_GATES"; fi

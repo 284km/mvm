@@ -8,8 +8,8 @@
 #
 #   mvm build [--kernel [--from-source]]
 #   mvm package
-#   mvm start [--name N] [--disk-size MiB] [--ram MB] [-p HOST:GUEST]...
-#             [--proxy-port P | --no-proxy]
+#   mvm start [--name N] [--disk-size MiB] [--ram MB] [--cpus N]
+#             [-p HOST:GUEST]... [--proxy-port P | --no-proxy]
 #   mvm stop  [--name N]
 #   mvm status [--name N]
 #   mvm doctor
@@ -30,6 +30,12 @@ MVM_HOME="${MVM_HOME:-$HOME/.mvm}"
 NAME=default
 DISK_MB=20480
 RAM_MB="${MVM_RAM_MB:-4096}"
+# ONE, because more is not free. A second CPU buys nothing on the operations
+# this is quickest at -- docker ps and docker run are a round trip, not
+# arithmetic -- and it buys a great deal when something is busy next to
+# something else: a web service beside three workers went from 530 ms to 100.
+# See test/vcpus.sh for the table.
+CPUS="${MVM_VCPUS:-1}"
 PORTS=""
 # THE WAY OUT. This guest has no network interface at all -- the VMM shows it a
 # block device and vsock, and nothing else -- so anything inside it that wants
@@ -60,6 +66,7 @@ while [ $# -gt 0 ]; do
     --name) NAME="$2"; shift 2;;
     --disk-size) DISK_MB="$2"; shift 2;;
     --ram) RAM_MB="$2"; shift 2;;
+    --cpus) CPUS="$2"; shift 2;;
     -p|--publish) PORTS="$PORTS $2"; shift 2;;
     --proxy-port) PROXY_PORT="$2"; PROXY_PINNED=1; shift 2;;
     --no-proxy) USE_PROXY=0; shift;;
@@ -183,11 +190,13 @@ ensure_disk() {
   sz=$(stat -f%z "$ird")
   istart=$((0x4a000000)); iend=$((istart + sz))
   MVM_BOOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 MVM_FORMAT=$mode" \
-  MVM_RAM_MB="$RAM_MB" "$out/mkdtb" "$D/format.dtb" "$istart" "$iend" >/dev/null 2>&1 \
+  MVM_RAM_MB="$RAM_MB" MVM_VCPUS=1 "$out/mkdtb" "$D/format.dtb" "$istart" "$iend" >/dev/null 2>&1 \
     || { echo "mvm: could not write the device tree for the format boot" >&2; exit 1; }
   # A DEADLINE, because this one is not a machine somebody is using: if it does
   # not finish it has hung, and a hang here would be a start that never returns.
-  MVM_RAM_MB="$RAM_MB" MVM_TIMEOUT_MS=300000 \
+  # One CPU to make a filesystem: the formatter runs mke2fs and copies files,
+  # and nothing about that is faster on four.
+  MVM_RAM_MB="$RAM_MB" MVM_VCPUS=1 MVM_TIMEOUT_MS=300000 \
     "$out/mvm-boot" "$out/Image" "$D/format.dtb" "$ird" "$D/disk.img" \
     > "$D/format.log" 2>&1
   if ! grep -qa "format: done" "$D/format.log"; then
@@ -253,8 +262,11 @@ start() {
     fi
   fi
   # No deadline: a machine somebody started is not on a timer.
+  # The tree and the machine are told the same number by the same variable:
+  # a tree that says four and a VMM that runs one is a guest looking for CPUs
+  # that are not there.
   MVM_BOOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/init$bootproxy" \
-  MVM_RAM_MB="$RAM_MB" "$out/mkdtb" "$D/machine.dtb" >/dev/null 2>&1 \
+  MVM_RAM_MB="$RAM_MB" MVM_VCPUS="$CPUS" "$out/mkdtb" "$D/machine.dtb" >/dev/null 2>&1 \
     || { echo "mvm: could not write the device tree" >&2; exit 1; }
   rm -f "$SOCK" "$CTL"
   # DIRECTLY in the background, not in a subshell: ( cmd ) & gives back the
@@ -265,6 +277,7 @@ start() {
   MVM_VSOCK_OUT="$outward" \
   MVM_CONTROL="$CTL" \
   MVM_RAM_MB="$RAM_MB" \
+  MVM_VCPUS="$CPUS" \
       "$out/mvm-boot" "$out/Image" "$D/machine.dtb" "" "$D/disk.img" \
       > "$D/console.log" 2> "$D/vmm.log" &
   echo $! > "$D/vmm.pid"
@@ -353,6 +366,7 @@ status() {
     echo "mvm: $NAME running (pid $(cat "$D/vmm.pid"))"
     echo "     socket   unix://$SOCK"
     echo "     disk     $D/disk.img ($(du -h "$D/disk.img" 2>/dev/null | cut -f1))"
+    echo "     cpus     $(grep -ao '[0-9]* cpus' "$D/vmm.log" 2>/dev/null | head -1 | cut -d' ' -f1 || echo 1)"
     if grep -qa "MENGD_PROXY=" "$D/console.log" 2>/dev/null; then
       echo "     outward  through a proxy on this machine (containers on the default bridge get it)"
     else
