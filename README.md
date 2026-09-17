@@ -519,10 +519,45 @@ would hang, and a hang says nothing at all. The build path itself is still
 checked where the client is Linux and the legacy builder works — that is
 mengd's own gate, with COPY, ADD, the cache and one layer per step.
 
+## Building one
+
+```
+sh tools/mvm build --kernel     # the guest's kernel, from a pinned package
+MERE=… MENGD_SRC=… MRUN_SRC=… sh tools/mvm build
+```
+
+**`build --kernel` is how a machine that has only macOS gets a Linux kernel.**
+Until now the answer was "gunzip `/boot/vmlinuz` on a Linux box that runs that
+kernel", which means somebody with only a Mac cannot start. It opens
+`linux-image-6.8.0-117-generic` and `linux-modules-…` (both, because the kernel
+package carries no modules) inside a container, unpacks the eight modules —
+each one is a capability — and writes `.build/kernel.lock` with the digest of
+everything it used.
+
+The pin is exact, and that is the point: the Image it produces has sha256
+`ce3cccaf…450e`, **byte for byte the kernel every check here has been green
+against**. Obtaining it this way is not a new kernel to re-validate.
+
+Alpine's `linux-virt` is half the download and was measured and set aside for
+one reason: `CONFIG_VIRTIO_MMIO=m`, `CONFIG_VIRTIO_BLK=m`, `CONFIG_EXT4_FS=m`.
+A kernel whose virtio and ext4 are modules cannot mount `root=/dev/vda` without
+an initramfs to load them first. Ubuntu's are all `=y`, which is exactly why
+this VMM boots with no initrd at all. (Its `vmlinuz` is also an EFI zboot
+container — `MZ\0\0zimg`, a gzip payload at a stated offset — so it is not a
+`gunzip` either. Both facts belong to whoever builds their own.)
+
+**`build` makes the rest**: the host's four (`mvm-boot`, `mkdtb`, `mports`,
+`mproxy`, the first two signed) and the guest's three (`mengd`, `mrun`, `mfwd`,
+static). The guest's land in `.build/guest/`, so **a machine can be started
+from this directory alone** — `MENGD_SRC` and `MRUN_SRC` are how they get
+built, not how they get used. It does not use `docker build`: the legacy
+builder in the Docker CLI on macOS hangs against any daemon, real ones
+included, and a tool that hangs while building itself is worse than a slow one.
+
 ## Starting one
 
 ```
-MENGD_SRC=… MRUN_SRC=… sh tools/mvm start [--name N] [--disk-size MiB] [-p HOST:GUEST]
+sh tools/mvm start [--name N] [--disk-size MiB] [-p HOST:GUEST] [--proxy-port P]
 sh tools/mvm status
 sh tools/mvm stop
 sh tools/mvm doctor
@@ -555,6 +590,16 @@ number they want.
 its own — no limit, nothing to measure, nothing to freeze — and the runtime
 said so into the container's own stderr, where a person running `docker run`
 saw a warning about the machine instead of their output.
+
+**It brings the way out with it.** This guest has no network interface at all,
+so everything that leaves goes through a proxy on this side; that was always
+possible and never automatic — `test/hub.sh` started `mproxy` by hand and
+passed three environment variables. `start` now starts it, on the first free
+port from 3128 upward, and tells the guest three agreeing facts: the vsock port
+that carries it, the forwarder to put on `0.0.0.0` inside, and the address the
+daemon should use. It takes **its own** port rather than reusing whatever is
+already on 3128 — that is squid's port, and a machine that found a stranger
+there would send everything inside it to that stranger.
 
 `test/lifecycle.sh` is the check: start, put things in, stop, start again, and
 ask what is there. It is the first check here that cares about **what

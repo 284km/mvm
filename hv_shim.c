@@ -359,8 +359,14 @@ int hv_now_secs(void) { return (int)time(NULL); }
  */
 /* Streams. Eight was enough for one client at a time; a forwarded port holds
  * one open for the life of every connection through it, and `docker compose
- * up` with published ports has several at once. */
-#define VS_MAX 32
+ * up` with published ports has several at once.
+ *
+ * 256 because 32 was a ceiling a real burst reached: forty `docker run` at
+ * once filled it, this function then stopped accepting, the backlog behind it
+ * filled, and eleven clients were told the daemon was not running. Must match
+ * vs_smax in vsock.mere -- the table is the same table, counted on both
+ * sides. */
+#define VS_MAX 256
 static int VS_FD[VS_MAX];
 /* "The peer will send no more." Not the same as "the connection is over":
  * a host program that closes its write side is still waiting to READ, and
@@ -493,7 +499,7 @@ int hv_vs_listen(const char *path, int gport) {
         in.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         in.sin_port = htons((uint16_t)port);
         if (bind(fd, (struct sockaddr *)&in, sizeof in) != 0) { close(fd); return -1; }
-        if (listen(fd, 16) != 0) { close(fd); return -1; }
+        if (listen(fd, 128) != 0) { close(fd); return -1; }
     } else {
     unlink(path);
     fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -503,7 +509,10 @@ int hv_vs_listen(const char *path, int gport) {
     a.sun_family = AF_UNIX;
     snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
     if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0) { close(fd); return -1; }
-    if (listen(fd, 16) != 0) { close(fd); return -1; }
+    /* 128, like every other listening socket here: the backlog is what holds
+     * a connection while the accept loop is busy, and when it overflows the
+     * client is REFUSED rather than delayed. */
+    if (listen(fd, 128) != 0) { close(fd); return -1; }
     }
     int fl = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, fl | O_NONBLOCK);

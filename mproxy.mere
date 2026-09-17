@@ -80,17 +80,102 @@ let drain_headers = fn (c: int) ->
     else let l = px_line c in if str_len l == 0 then () else go (n - 1) in
   go 64;
 
+// ---- plain HTTP, fetched rather than tunnelled -----------------------------
+//
+// "GET http://host/path HTTP/1.1" is a client asking this to fetch for it.
+// For https that would mean this end doing the TLS and the caller verifying
+// nothing, which is why it is refused. For http there is nothing to weaken:
+// the bytes are in the clear either way, and the only question is who makes
+// the connection. So this one is answered.
+//
+// It matters because of which clients ask. busybox's wget -- the wget inside
+// almost every alpine image -- has no CONNECT at all: with http_proxy set it
+// sends exactly this, and without an answer to it the variable this machine
+// hands out would be a promise it does not keep.
+//
+// "http://host[:port]/path" -> ("host", port, "/path"). No scheme, or any
+// other scheme, gives ("", 0, "").
+let parse_absolute = fn (target: str) ->
+  if str_len target < 8 || substring target 0 7 != "http://" then ("", 0, "")
+  else
+    let rest = substring target 7 (str_len target) in
+    let sl = str_index_of rest "/" in
+    let hostport = if sl < 0 then rest else substring rest 0 sl in
+    let path = if sl < 0 then "/" else substring rest sl (str_len rest) in
+    let c = last_colon hostport in
+    // An IPv6 literal in a URL is bracketed, and this does not take one: the
+    // guest reaches names, and a name is what a proxy is for.
+    if c < 0 then (if str_len hostport == 0 then ("", 0, "") else (hostport, 80, path))
+    else
+      let h = substring hostport 0 c in
+      let p = num_or0 (substring hostport (c + 1) (str_len hostport)) in
+      if str_len h == 0 || p <= 0 || p > 65535 then ("", 0, "") else (h, p, path);
+
+// The client's headers, passed on rather than dropped -- they are the request.
+// Two are rewritten: Proxy-Connection is between the client and this, and says
+// nothing to the far side; Connection is forced closed because this forwards
+// one request per connection and a kept-alive one would wait for a second that
+// never comes.
+let forward_headers = fn (c: int) -> fn (up: int) ->
+  let rec go = fn (n: int) ->
+    if n == 0 then ()
+    else
+      let l = px_line c in
+      if str_len l == 0 then ()
+      else
+        let low = str_index_of l ":" in
+        let name = if low < 0 then l else substring l 0 low in
+        let hopbyhop = name == "Proxy-Connection" || name == "proxy-connection"
+                || name == "Connection" || name == "connection" in
+        let _ = if hopbyhop then () else (let _ = px_write up (l ++ "\r\n") in ()) in
+        go (n - 1) in
+  let _ = go 64 in
+  let _ = px_write up "Connection: close\r\n\r\n" in
+  ();
+
 let serve_one = fn (c: int) ->
   let line = px_line c in
+  if str_len line == 0 then
+    // Nothing was said. A port check opens and closes without a word, and
+    // answering it 405 puts a refusal in the log for something that never
+    // asked. `mvm start` does exactly this to find out whether the proxy is up.
+    (let _ = px_close c in ())
+  else
   let (h, p) = parse_connect line in
   if str_len h == 0 then
+    // Not a CONNECT. If it is an absolute http:// URL, fetch it: see
+    // parse_absolute for why that is answered and https is not.
+    let sp1 = str_index_of line " " in
+    let rest = if sp1 < 0 then "" else substring line (sp1 + 1) (str_len line) in
+    let sp2 = str_index_of rest " " in
+    let target = if sp2 < 0 then rest else substring rest 0 sp2 in
+    let verb = if sp1 < 0 then "" else substring line 0 sp1 in
+    let ver = if sp2 < 0 then "HTTP/1.1" else substring rest (sp2 + 1) (str_len rest) in
+    let (ah, ap, apath) = parse_absolute target in
+    if str_len ah > 0 then
+      let up = px_connect ah ap in
+      if up < 0 then
+        let _ = print_err ("mproxy: cannot reach " ++ ah ++ ":" ++ show ap
+                        ++ (if up == 0 - 2 then " (no such host)" else " (nothing listening)")) in
+        let _ = px_write c "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n" in
+        let _ = px_close c in ()
+      else
+        let _ = if tracing () then
+                  print_err ("mproxy: " ++ verb ++ " " ++ ah ++ ":" ++ show ap ++ apath) else () in
+        // Origin form, which is what a server expects. The absolute form is
+        // between the client and a proxy.
+        let _ = px_write up (verb ++ " " ++ apath ++ " " ++ ver ++ "\r\n") in
+        let _ = forward_headers c up in
+        let _ = px_pipe c up in
+        ()
+    else
     let _ = if tracing () then print_err ("mproxy: refused " ++ line) else () in
-    // Said, not just refused. A client that sends "GET http://host/path" is
-    // asking this to FETCH on its behalf, which is a different thing from
-    // tunnelling -- and for https it would mean this end doing the TLS, so the
-    // caller would verify nothing. busybox's wget asks exactly that and has no
-    // CONNECT; curl, apk, npm and pip all tunnel.
-    let body = "this proxy tunnels with CONNECT; it does not fetch on your behalf\n" in
+    // Said, not just refused. https:// in an absolute URL would mean this end
+    // doing the TLS, so the caller would verify nothing -- which is the one
+    // thing this must not offer. A relative path means the client thinks this
+    // is an origin server; it is not one.
+    let body = "this proxy tunnels https with CONNECT and fetches plain http://;"
+            ++ " it will not terminate TLS for you\n" in
     let _ = px_write c ("HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\n"
                      ++ "Content-Length: " ++ show (str_len body) ++ "\r\n\r\n" ++ body) in
     let _ = px_close c in ()
@@ -122,7 +207,12 @@ let serve = fn (port: int) ->
     else
       // A thread per connection: px_pipe runs until both directions have
       // ended, so a serial loop would serve one caller ever.
-      let _ = spawn (fn (x: unit) -> let _ = serve_one c in ()) in
+      //
+      // DETACHED. A spawn handle that is thrown away leaves a joinable thread
+      // behind -- the runtime says so where detach is defined -- and this
+      // makes one per connection. The same defect cost the daemon every
+      // container past the thirtieth.
+      let _ = detach (spawn (fn (x: unit) -> let _ = serve_one c in ())) in
       loop () in
   loop ();
 

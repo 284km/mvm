@@ -6,7 +6,9 @@
 # it". The pieces are a guest disk, a device tree, the VMM, the port watcher,
 # and a docker client pointed at the right socket.
 #
+#   mvm build [--kernel]
 #   mvm start [--name N] [--disk-size MiB] [--ram MB] [-p HOST:GUEST]...
+#             [--proxy-port P | --no-proxy]
 #   mvm stop  [--name N]
 #   mvm status [--name N]
 #   mvm doctor
@@ -23,6 +25,20 @@ NAME=default
 DISK_MB=20480
 RAM_MB="${MVM_RAM_MB:-4096}"
 PORTS=""
+# THE WAY OUT. This guest has no network interface at all -- the VMM shows it a
+# block device and vsock, and nothing else -- so anything inside it that wants
+# to reach the world does it by asking a proxy on this side. Without one, a
+# `docker build` step cannot `apk add` and a container cannot reach an API.
+#
+# It was always possible and never automatic: test/hub.sh started mproxy by
+# hand and passed three environment variables, which is the difference between
+# "the stack can do it" and "the tool does it".
+PROXY_PORT="${MVM_PROXY_PORT:-3128}"
+PROXY_PINNED=0        # 1 once somebody names the port, and then it is theirs
+USE_PROXY=1
+KERNEL_ONLY=0
+KVER=""
+KDIR=""
 
 usage() {
   sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
@@ -37,6 +53,11 @@ while [ $# -gt 0 ]; do
     --disk-size) DISK_MB="$2"; shift 2;;
     --ram) RAM_MB="$2"; shift 2;;
     -p|--publish) PORTS="$PORTS $2"; shift 2;;
+    --proxy-port) PROXY_PORT="$2"; PROXY_PINNED=1; shift 2;;
+    --no-proxy) USE_PROXY=0; shift;;
+    --kernel) KERNEL_ONLY=1; shift;;
+    --version) KVER="$2"; shift 2;;
+    --from-dir) KDIR="$2"; shift 2;;
     *) echo "mvm: unknown option $1" >&2; usage;;
   esac
 done
@@ -46,6 +67,18 @@ CTL="$D/control.sock"
 
 # WHAT THIS MACHINE NEEDS, each named. A missing kernel and a missing module
 # are different sentences, and "it did not start" is neither of them.
+# Where a guest binary is: built here, or in the checkout it came from.
+guest_bin() {
+  case "$1" in
+    mengd) [ -x "$out/guest/mengd" ] && { echo "$out/guest/mengd"; return; }
+           echo "${MENGD_SRC:-}/.build/mengd-linux";;
+    mrun)  [ -x "$out/guest/mrun" ] && { echo "$out/guest/mrun"; return; }
+           echo "${MRUN_SRC:-}/.build/mrun-linux";;
+    mfwd)  [ -x "$out/guest/mfwd" ] && { echo "$out/guest/mfwd"; return; }
+           echo "$out/mfwd-linux";;
+  esac
+}
+
 doctor() {
   rc=0
   chk() { if [ -r "$2" ] || [ -x "$2" ]; then echo "  ok    $1"; else echo "  MISSING $1 -- $3"; rc=1; fi; }
@@ -54,11 +87,32 @@ doctor() {
   chk "the VMM"                    "$out/mvm-boot"  "sh test/stack.sh builds it, or build boot.mere yourself"
   chk "the device tree writer"     "$out/mkdtb"     "same"
   chk "the port watcher"           "$out/mports"    "same"
+  chk "the way out (a CONNECT proxy)" "$out/mproxy" "same -- without it nothing inside can reach the network"
+
   for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport overlay veth bridge stp llc; do
     chk "module $m.ko" "$out/extra/$m.ko" "from /lib/modules/\$(uname -r) of THAT kernel; each one missing costs a feature"
   done
-  chk "the daemon for the guest"   "${MENGD_SRC:-}/.build/mengd-linux" "set MENGD_SRC and build it for linux/arm64"
-  chk "the runtime for the guest"  "${MRUN_SRC:-}/.build/mrun-linux"   "set MRUN_SRC and build it for linux/arm64"
+  # THIS DIRECTORY FIRST. `mvm build` puts them in .build/guest, so a machine
+  # can be started from here alone; a checkout next door is how they get built,
+  # not how they get used.
+  chk "the daemon for the guest"   "$(guest_bin mengd)" "sh tools/mkbuild.sh (or set MENGD_SRC and build it for linux/arm64)"
+  chk "the runtime for the guest"  "$(guest_bin mrun)"  "sh tools/mkbuild.sh (or set MRUN_SRC and build it for linux/arm64)"
+  # WHICH kernel, not just that there is one. Two machines with the same tool
+  # and different kernels behave differently, and the difference is invisible
+  # until something a module provides is missing.
+  if [ -r "$out/kernel.lock" ]; then
+    echo "  ok    the kernel is $(awk '/^version /{print $2}' "$out/kernel.lock") ($(awk '/Image$/{print substr($1,1,12)}' "$out/kernel.lock"))"
+  else
+    echo "  ok    a kernel is present, but nothing records which -- sh tools/mkkernel.sh writes .build/kernel.lock"
+  fi
+  # QUARANTINE. A binary that arrived in a download carries an attribute that
+  # makes macOS refuse to run it, and the refusal names Gatekeeper rather than
+  # this tool. Nothing here can remove it for the user -- that is the point of
+  # it -- so it is named.
+  if xattr -p com.apple.quarantine "$out/mvm-boot" >/dev/null 2>&1; then
+    echo "  MISSING permission to run the VMM -- it is quarantined; xattr -d com.apple.quarantine $out/mvm-boot"
+    rc=1
+  fi
   codesign -dv "$out/mvm-boot" 2>&1 | grep -q "Signature" \
     && echo "  ok    the VMM is signed (Hypervisor.framework refuses an unsigned one)" \
     || { echo "  MISSING a signature on $out/mvm-boot -- codesign --sign - --force --entitlements mvm.entitlements"; rc=1; }
@@ -77,9 +131,9 @@ start() {
   # The guest's payload: the daemon, the runtime, the forwarder, the modules.
   payload="$D/payload"; rm -rf "$payload"; mkdir -p "$payload"
   cp "$out"/extra/*.ko "$payload/" 2>/dev/null
-  cp "$MENGD_SRC/.build/mengd-linux" "$payload/mengd"
-  cp "$MRUN_SRC/.build/mrun-linux" "$payload/mrun"
-  [ -x "$out/mfwd-linux" ] && cp "$out/mfwd-linux" "$payload/mfwd"
+  cp "$(guest_bin mengd)" "$payload/mengd"
+  cp "$(guest_bin mrun)" "$payload/mrun"
+  [ -x "$(guest_bin mfwd)" ] && cp "$(guest_bin mfwd)" "$payload/mfwd"
   chmod 755 "$payload"/mengd "$payload"/mrun "$payload"/mfwd 2>/dev/null
   if [ ! -r "$D/disk.img" ]; then
     echo "mvm: making a ${DISK_MB} MiB disk (this is decided once; growing it means making a new one)"
@@ -99,8 +153,49 @@ start() {
     h="${p%%:*}"; g="${p##*:}"
     inward="$inward,tcp:$h=$g"
   done
+  # The way out, before the machine that will use it.
+  #
+  # Three facts have to agree, and they are written here once: the host port
+  # the proxy listens on, the vsock port the VMM carries to it, and the address
+  # the guest is told to use. The convention everywhere else in this tool --
+  # the vsock port IS the host port -- holds here too.
+  #
+  # ITS OWN, ON A FREE PORT. The first version reused whatever was already
+  # listening on 3128, which is wrong in the case that matters: 3128 is squid's
+  # port, and a machine that finds a stranger there would send everything
+  # inside it to that stranger. So the default port is a STARTING POINT and the
+  # first free one above it is taken. A port somebody names with --proxy-port
+  # is theirs: if it is busy, that is an error and not a reason to use another.
+  outward=""; bootproxy=""
+  if [ "$USE_PROXY" = 1 ] && [ -x "$out/mproxy" ]; then
+    if [ "$PROXY_PINNED" = 0 ]; then
+      tries=0
+      while nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null && [ "$tries" -lt 64 ]; do
+        PROXY_PORT=$((PROXY_PORT + 1)); tries=$((tries + 1))
+      done
+    fi
+    if nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null; then
+      echo "mvm: 127.0.0.1:$PROXY_PORT is busy and was asked for by name -- nothing inside will reach the network" >&2
+    else
+      "$out/mproxy" "$PROXY_PORT" > "$D/mproxy.log" 2>&1 &
+      echo $! > "$D/mproxy.pid"
+      i=0
+      while [ "$i" -lt 40 ] && ! nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null; do sleep 0.25; i=$((i + 1)); done
+      nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null \
+        || { echo "mvm: the proxy did not come up on $PROXY_PORT; see $D/mproxy.log" >&2
+             rm -f "$D/mproxy.pid"; }
+    fi
+    if [ -r "$D/mproxy.pid" ] && nc -z 127.0.0.1 "$PROXY_PORT" 2>/dev/null; then
+      outward="$PROXY_PORT=tcp:$PROXY_PORT"
+      # MVM_FWD_OUT puts a forwarder inside the guest on 0.0.0.0:<port>, which
+      # is where a CONTAINER reaches it -- on the bridge address, not 127.0.0.1,
+      # which in a container is its own loopback. MENGD_PROXY is the daemon's
+      # own copy, in the machine's namespace, where 127.0.0.1 is right.
+      bootproxy=" MVM_FWD_OUT=$PROXY_PORT:$PROXY_PORT MENGD_PROXY=127.0.0.1:$PROXY_PORT"
+    fi
+  fi
   # No deadline: a machine somebody started is not on a timer.
-  MVM_BOOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/init" \
+  MVM_BOOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 root=/dev/vda rw init=/sbin/init$bootproxy" \
   MVM_RAM_MB="$RAM_MB" "$out/mkdtb" "$D/machine.dtb" >/dev/null 2>&1 \
     || { echo "mvm: could not write the device tree" >&2; exit 1; }
   rm -f "$SOCK" "$CTL"
@@ -109,6 +204,7 @@ start() {
   # tidy-up problem, because the next start binds the same socket, fails, and
   # the OLD guest answers it.
   MVM_VSOCK_IN="$inward" \
+  MVM_VSOCK_OUT="$outward" \
   MVM_CONTROL="$CTL" \
   MVM_RAM_MB="$RAM_MB" \
       "$out/mvm-boot" "$out/Image" "$D/machine.dtb" "" "$D/disk.img" \
@@ -134,6 +230,9 @@ start() {
 
 stop() {
   if [ -r "$D/mports.pid" ]; then kill "$(cat "$D/mports.pid")" 2>/dev/null; rm -f "$D/mports.pid"; fi
+  # Only the one this machine started. A proxy that was already there when it
+  # started belongs to somebody else.
+  if [ -r "$D/mproxy.pid" ]; then kill "$(cat "$D/mproxy.pid")" 2>/dev/null; rm -f "$D/mproxy.pid"; fi
   if ! running; then echo "mvm: $NAME is not running"; rm -f "$D/vmm.pid" "$SOCK" "$CTL"; return 0; fi
   pid="$(cat "$D/vmm.pid")"
   # ASK THE MACHINE TO STOP BEFORE KILLING IT. Killing the VMM loses whatever
@@ -166,6 +265,11 @@ status() {
     echo "mvm: $NAME running (pid $(cat "$D/vmm.pid"))"
     echo "     socket   unix://$SOCK"
     echo "     disk     $D/disk.img ($(du -h "$D/disk.img" 2>/dev/null | cut -f1))"
+    if grep -qa "MENGD_PROXY=" "$D/console.log" 2>/dev/null; then
+      echo "     outward  through a proxy on this machine (containers on the default bridge get it)"
+    else
+      echo "     outward  none -- nothing inside can reach the network"
+    fi
     grep -a "userspace: \(overlay mounts\|bridge and veth\)" "$D/console.log" 2>/dev/null | sed 's/^.*userspace: /     guest:   /'
   else
     echo "mvm: $NAME is not running"
@@ -173,7 +277,19 @@ status() {
   fi
 }
 
+build() {
+  if [ "$KERNEL_ONLY" = 1 ]; then
+    set --
+    [ -n "$KVER" ] && set -- "$@" --version "$KVER"
+    [ -n "$KDIR" ] && set -- "$@" --from-dir "$KDIR"
+    sh "$here/tools/mkkernel.sh" "$@"
+  else
+    sh "$here/tools/mkbuild.sh"
+  fi
+}
+
 case "$cmd" in
+  build) build;;
   start) start;;
   stop) stop;;
   status) status;;

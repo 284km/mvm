@@ -73,8 +73,26 @@ let vs_isr_reads = 23;   // how many times the guest has read this device's ISR
 let vs_polls = 24;       // how many times the host end has been asked
 let vs_next_hport = 25;  // this end's port for the next inward stream
 let vs_in_port = 26;     // non-zero once anything is listening inward
-let vs_sfirst = 27; let vs_sstride = 8; let vs_smax = 32;
-let vs_state_n = 27 + 32 * 8;
+// 256, not 32. The table is the ceiling on how many streams can be OPEN AT
+// ONCE, and a burst of clients is exactly that: forty `docker run` at the same
+// moment filled it, the accept loop then stopped taking connections, the
+// listening socket's backlog filled behind it, and eleven of the forty were
+// told "Cannot connect to the Docker daemon" -- which is true and names the
+// wrong machine.
+//
+// Back pressure belongs in the daemon, where a request that waits is a request
+// that waits. Here it turns into a refused connection, which is a failure.
+let vs_sfirst = 27; let vs_sstride = 8; let vs_smax = 256;
+// One slot after the table: how many inward connections were refused while it
+// was full. Written in terms of the constants above rather than spelled again
+// -- the previous spelling was `27 + 32 * 8`, which is a second place to
+// remember when vs_smax changes.
+let vs_refused = vs_sfirst + vs_smax * vs_sstride;
+// And a total that is never reset. The episode counter answers "is it full
+// now"; a check that runs afterwards needs "was it ever", and a counter that
+// clears itself answers no to both.
+let vs_refused_all = vs_refused + 1;
+let vs_state_n = vs_refused_all + 1;
 
 // A stream's fields, and its state: free, waiting for the guest to answer a
 // REQUEST this end sent, or open.
@@ -286,10 +304,25 @@ let vs_accept = fn (s) ->
   else
     let h = hv_vs_accept () in
     if h == 0 - 2 then
-      let _ = print_err ("mvm: vsock refused an inward connection: all "
-                      ++ show vs_smax ++ " streams are in use") in 0
+      // SAID ONCE, NOT ONCE PER POLL. This is asked on every WFI, so a table
+      // that stays full prints for as long as it stays full: one stuck run
+      // produced 177,680 lines and 12.9 MB, which buries the line that says
+      // what happened first. The count is kept and reported when it clears.
+      let n = (vec_get s vs_refused : int) in
+      let _ = if n == 0 then
+                (let _ = print_err ("mvm: vsock is refusing inward connections: all "
+                                 ++ show vs_smax ++ " streams are in use") in ())
+              else () in
+      let _ = vec_set s vs_refused_all ((vec_get s vs_refused_all : int) + 1) in
+      let _ = vec_set s vs_refused (n + 1) in 0
     else if h < 0 then 0
     else
+      let n = (vec_get s vs_refused : int) in
+      let _ = if n > 0 then
+                (let _ = print_err ("mvm: vsock has room again (" ++ show n
+                                 ++ " inward connections were refused)") in
+                 let _ = vec_set s vs_refused 0 in ())
+              else () in
       let i = vs_alloc s in
       if i < 0 then
         let _ = print_err "mvm: vsock refused an inward connection: no free stream" in
@@ -331,6 +364,14 @@ let vs_accept = fn (s) ->
 //   LISTEN <port>    -> ok listening <port>   / err <reason>
 //   UNLISTEN <port>  -> ok closed <port>      / err no listener for <port>
 //   PORTS            -> ok <n> listeners
+//   STREAMS          -> ok <in use> of <max>, <refused> refused
+//
+// STREAMS exists because the question "what is still held while N containers
+// run" was being answered by SUBTRACTING two counts of log lines, and that
+// subtraction is wrong in two directions: a release is logged for outward
+// streams too, and for a stream the guest never accepted, neither of which has
+// an "accepted" line. It produced -6, which is not a number of anything. A
+// table can be counted; a derived number cannot be trusted to be one.
 //
 // It is the VMM's own socket, not the guest's, and it says nothing about
 // containers: it opens and closes host ports, and who wanted one is the
@@ -365,6 +406,12 @@ let vs_ctl_do = fn (s) -> fn (line: str) ->
   let arg = vs_word line 1 in
   let port = vs_num arg in
   if verb == "PORTS" then "ok " ++ show (hv_vs_listener_count ()) ++ " listeners"
+  else if verb == "STREAMS" then
+    (let rec go = fn (i: int) -> fn (n: int) ->
+       if i == vs_smax then n
+       else go (i + 1) (if sget s i s_st == st_free then n else n + 1) in
+     "ok " ++ show (go 0 0) ++ " of " ++ show vs_smax ++ ", "
+           ++ show (vec_get s vs_refused_all : int) ++ " refused")
   else if verb == "LISTEN" then
     (if port <= 0 || port > 65535 then "err " ++ arg ++ " is not a port"
      else
