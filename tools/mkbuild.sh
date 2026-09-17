@@ -99,6 +99,14 @@ for p in "$MENGD_SRC/.build/mengd-linux:mengd" "$MRUN_SRC/.build/mrun-linux:mrun
   else echo "mkbuild: $name did not build" >&2; fail=1; fi
 done
 
+echo "== the initramfs that makes a disk =="
+# LAST, because it contains the guest's programs and the kernel's modules: it
+# is the thing a person downloads, and it is how a machine gets a filesystem on
+# a system that cannot write ext4.
+if sh "$here/tools/mkinitrd.sh" 2>&1 | sed 's/^/  /'; then :; else
+  echo "  (needs mvm build --kernel first, for the modules)" >&2; fail=1
+fi
+
 echo "== what is missing =="
 sh "$here/tools/mvm" doctor || fail=1
 [ "$fail" = 0 ] || { echo "mkbuild: something did not build" >&2; exit 1; }

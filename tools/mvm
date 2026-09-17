@@ -88,6 +88,7 @@ doctor() {
   chk "the device tree writer"     "$out/mkdtb"     "same"
   chk "the port watcher"           "$out/mports"    "same"
   chk "the way out (a CONNECT proxy)" "$out/mproxy" "same -- without it nothing inside can reach the network"
+  chk "the initramfs that makes a disk" "$out/initrd-format.gz" "sh tools/mkinitrd.sh -- the guest formats its own disk, because macOS cannot write ext4"
 
   for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport overlay veth bridge stp llc; do
     chk "module $m.ko" "$out/extra/$m.ko" "from /lib/modules/\$(uname -r) of THAT kernel; each one missing costs a feature"
@@ -124,28 +125,61 @@ running() {
   kill -0 "$(cat "$D/vmm.pid")" 2>/dev/null
 }
 
+# THE DISK, MADE BY THE MACHINE THAT WILL USE IT.
+#
+# It used to be made here, with `docker create` for the tree and a container
+# running mke2fs for the filesystem -- which means a tool that replaces docker
+# needed docker to install, on a system that has nothing else that writes ext4.
+#
+# The host makes a file of the right size, which is all `dd` does, and the
+# guest does the rest: one boot of the format initramfs, about four seconds,
+# and then it powers itself off. The RUNNING path is untouched -- that is why
+# this powers off rather than switch_root, since the ordinary boot is the one
+# every check here is green against.
+#
+# It runs again when the initramfs changes, in `refresh` mode, which copies the
+# daemon and the runtime in without touching the filesystem. Before that,
+# upgrading this tool meant deleting the machine.
+ensure_disk() {
+  ird="$out/initrd-format.gz"
+  want="$(shasum -a 256 "$ird" 2>/dev/null | cut -d' ' -f1)"
+  mode=""
+  if [ ! -r "$D/disk.img" ]; then
+    echo "mvm: making a ${DISK_MB} MiB disk (this is decided once; growing it means making a new one)"
+    # Sparse: the file is as big as it says and costs what is written to it.
+    dd if=/dev/zero of="$D/disk.img" bs=1m count=0 seek="$DISK_MB" 2>/dev/null \
+      || { echo "mvm: could not make $D/disk.img" >&2; exit 1; }
+    mode=format
+  elif [ "$want" != "$(cat "$D/initrd.id" 2>/dev/null)" ]; then
+    echo "mvm: this tool has been rebuilt -- installing the new guest programs"
+    mode=refresh
+  fi
+  [ -n "$mode" ] || return 0
+
+  sz=$(stat -f%z "$ird")
+  istart=$((0x4a000000)); iend=$((istart + sz))
+  MVM_BOOTARGS="earlycon=pl011,0x9000000 console=ttyAMA0 panic=-1 MVM_FORMAT=$mode" \
+  MVM_RAM_MB="$RAM_MB" "$out/mkdtb" "$D/format.dtb" "$istart" "$iend" >/dev/null 2>&1 \
+    || { echo "mvm: could not write the device tree for the format boot" >&2; exit 1; }
+  # A DEADLINE, because this one is not a machine somebody is using: if it does
+  # not finish it has hung, and a hang here would be a start that never returns.
+  MVM_RAM_MB="$RAM_MB" MVM_TIMEOUT_MS=300000 \
+    "$out/mvm-boot" "$out/Image" "$D/format.dtb" "$ird" "$D/disk.img" \
+    > "$D/format.log" 2>&1
+  if ! grep -qa "format: done" "$D/format.log"; then
+    echo "mvm: the guest could not prepare its disk:" >&2
+    grep -a "format:" "$D/format.log" | sed 's/^.*format: /  /' >&2
+    exit 1
+  fi
+  grep -a "format:" "$D/format.log" | sed 's/^.*format: /  disk: /'
+  echo "$want" > "$D/initrd.id"
+}
+
 start() {
   doctor >/dev/null 2>&1 || { doctor; echo "mvm: not starting until those are there" >&2; exit 1; }
   if running; then echo "mvm: $NAME is already running (pid $(cat "$D/vmm.pid"))"; exit 0; fi
   mkdir -p "$D"
-  # The guest's payload: the daemon, the runtime, the forwarder, the modules.
-  payload="$D/payload"; rm -rf "$payload"; mkdir -p "$payload"
-  cp "$out"/extra/*.ko "$payload/" 2>/dev/null
-  cp "$(guest_bin mengd)" "$payload/mengd"
-  cp "$(guest_bin mrun)" "$payload/mrun"
-  [ -x "$(guest_bin mfwd)" ] && cp "$(guest_bin mfwd)" "$payload/mfwd"
-  chmod 755 "$payload"/mengd "$payload"/mrun "$payload"/mfwd 2>/dev/null
-  if [ ! -r "$D/disk.img" ]; then
-    echo "mvm: making a ${DISK_MB} MiB disk (this is decided once; growing it means making a new one)"
-    # The reason, not a summary of it. mkrootfs builds the image inside a
-    # container with the target directory bind-mounted, so a state directory
-    # the container runtime does not share (anything outside $HOME, usually)
-    # fails in a way only its own output explains.
-    sh "$here/tools/mkrootfs.sh" "$D/disk.img" "$DISK_MB" "$payload" > "$D/mkrootfs.log" 2>&1 \
-      || { echo "mvm: could not build the guest disk:" >&2; tail -3 "$D/mkrootfs.log" >&2
-           echo "mvm: (MVM_HOME is $MVM_HOME -- it has to be somewhere the container runtime shares)" >&2
-           exit 1; }
-  fi
+  ensure_disk
   # Published ports are agreed in advance here, because opening the host's end
   # is the host's job: the convention is that the vsock port IS the host port.
   inward="$SOCK=1024"

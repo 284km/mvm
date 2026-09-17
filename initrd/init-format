@@ -1,0 +1,90 @@
+#!/bin/sh
+# initrd/init-format — the guest makes its own disk.
+#
+# WHY THIS EXISTS. Everything else about distributing this stack turned out to
+# be easy -- 25 MB compressed, an adhoc signature that survives a tarball --
+# and then the root filesystem was built by `docker create` and `mke2fs` in a
+# container. A tool that replaces docker cannot require docker to install, and
+# macOS has nothing that writes ext4.
+#
+# It does not have to. The guest has a kernel with ext4 in it and this
+# initramfs has mke2fs, so the host only has to make a file of the right size
+# -- which is `dd` -- and the machine does the rest, once, before it is a
+# machine.
+#
+# IT POWERS OFF RATHER THAN switch_root. The running path (root=/dev/vda,
+# init=/sbin/init) is the one every check here is green against, and a second
+# way to reach it would be a second thing to keep working. One extra boot of
+# about four seconds, once in the life of a machine, buys leaving it alone.
+#
+# Two modes, on the kernel command line as MVM_FORMAT:
+#   format    make the filesystem if there is none, then install
+#   refresh   install only -- the tool was rebuilt and the disk has old binaries
+mkdir -p /proc /sys /dev 2>/dev/null
+mount -t devtmpfs dev /dev 2>/dev/null
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+say() { echo "format: $1" > /dev/kmsg; }
+fail() { say "FAILED: $1"; sync; poweroff -f; exit 1; }
+
+mode=format
+for w in $(cat /proc/cmdline 2>/dev/null); do
+  case "$w" in MVM_FORMAT=*) mode="${w#MVM_FORMAT=}";; esac
+done
+say "starting in $mode mode"
+
+[ -b /dev/vda ] || fail "there is no /dev/vda"
+say "vda has $(cat /sys/block/vda/size 2>/dev/null) sectors"
+
+# IS THERE A FILESYSTEM ALREADY. Read the ext4 superblock's magic rather than
+# asking a tool: 0xEF53 at byte 1080, little-endian, which is the definition.
+# blkid would answer this too and is not in every busybox.
+magic=$(dd if=/dev/vda bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+if [ "$magic" = "53ef" ]; then
+  say "there is already an ext4 here"
+  [ "$mode" = format ] && say "leaving it alone"
+else
+  [ "$mode" = refresh ] && fail "asked to refresh a disk with no filesystem on it"
+  say "making one"
+  mke2fs -q -t ext4 -F /dev/vda 2>/tmp/e || fail "mke2fs: $(head -c 150 /tmp/e | tr -d '\n')"
+  say "mke2fs ok"
+fi
+
+mkdir -p /mnt
+mount -t ext4 /dev/vda /mnt 2>/tmp/e2 || fail "mount: $(head -c 150 /tmp/e2 | tr -d '\n')"
+
+# THE ROOT FILESYSTEM IS THIS ONE. Copied rather than fetched: this initramfs
+# is a userspace that already works, and the alternative is a download on a
+# machine whose whole problem is that it has no way out yet.
+if [ ! -x /mnt/bin/busybox ] && [ ! -x /mnt/bin/sh ]; then
+  say "populating"
+  for d in bin etc lib sbin usr var root home srv; do
+    [ -e "/$d" ] && cp -a "/$d" /mnt/ 2>/dev/null
+  done
+  mkdir -p /mnt/proc /mnt/sys /mnt/dev /mnt/run /mnt/tmp /mnt/opt /mnt/var/log
+  chmod 1777 /mnt/tmp
+fi
+
+# THE PAYLOAD, EVERY TIME. The daemon, the runtime, the forwarder and the
+# modules are copied on every one of these boots, not only the first: without
+# that, upgrading the tool means deleting the machine, which is what it used to
+# mean and the reason `refresh` exists.
+mkdir -p /mnt/opt
+cp -a /payload/opt/. /mnt/opt/ 2>/dev/null || fail "no payload to install"
+chmod 755 /mnt/opt/* 2>/dev/null
+# /sbin/init in an image is a symlink to busybox, and copying onto a symlink
+# fails -- removing it first is the difference between replacing init and
+# building a machine that boots somebody else's.
+rm -f /mnt/sbin/init
+cp /payload/init-mengd-disk /mnt/sbin/init || fail "no init to install"
+chmod 755 /mnt/sbin/init
+grep -q "init-mengd-disk" /mnt/sbin/init || fail "the init that was installed is not the one this was given"
+
+n=$(find /mnt -xdev | wc -l)
+[ "$n" -gt 100 ] || fail "the tree has $n entries, which is empty"
+say "installed: $n entries, $(ls /mnt/opt | wc -l) in /opt"
+sync
+umount /mnt || fail "umount"
+say "done"
+sync
+poweroff -f

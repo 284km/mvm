@@ -39,8 +39,8 @@ export MVM_HOME="${MVM_HOME:-$HOME/.mvm}"
 D="$MVM_HOME/$M"
 out="$here/.build"; mkdir -p "$out"
 cleanup() {
-  [ -d "$D" ] && { cp "$D/mproxy.log" "$out/outward-mproxy.log" 2>/dev/null
-                   cp "$D/console.log" "$out/outward-console.log" 2>/dev/null; }
+  [ -d "$D" ] && { cp "$D/mproxy.log" "$out/outward-$M-mproxy.log" 2>/dev/null
+                   cp "$D/console.log" "$out/outward-$M-console.log" 2>/dev/null; }
   sh "$here/tools/mvm" stop --name "$M" >/dev/null 2>&1
   rm -rf "$D"; docker context rm "mvm-$M" >/dev/null 2>&1
 }

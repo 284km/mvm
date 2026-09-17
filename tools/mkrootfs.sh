@@ -1,7 +1,15 @@
 #!/bin/sh
-# tools/mkrootfs.sh — an ext4 root filesystem for the guest.
+# tools/mkrootfs.sh — an ext4 root filesystem for the guest, built on the HOST.
 #
 #   sh tools/mkrootfs.sh <out.img> <size MiB> [extra dir]
+#
+# FOR THE CHECKS, NOT FOR INSTALLING. This needs docker twice -- once for the
+# tree and once for mke2fs -- which is fine for a check running beside a docker
+# that is already there, and impossible for a person installing a tool that
+# replaces docker. `tools/mvm start` makes its disk the other way: the host
+# makes a file of the right size and the GUEST formats it, from
+# initrd/init-format. This one stays because several checks want a disk built
+# from a particular image with a particular payload, before there is a machine.
 #
 # WHY A DISK AND NOT THE INITRAMFS. pivot_root refuses to work when the current
 # root is the initramfs -- `mrun: pivot_root (errno 22)` -- so a container

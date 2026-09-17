@@ -44,12 +44,16 @@ out="$here/.build"; mkdir -p "$out"
 # THE EVIDENCE OUTLIVES THE MACHINE. The first run of this check failed four
 # times and then deleted the only log that could say why. Whatever it found,
 # the logs are copied out before the machine goes.
+# NAMED PER RUN. These are kept so a failure can be read afterwards, and a
+# fixed name means the next run overwrites the evidence of the last one -- which
+# is what happened: one failure in a row of five gates, and by the time it was
+# looked at, a later run had replaced both logs.
 cleanup() {
-  [ -d "$D" ] && { cp "$D/vmm.log" "$out/scale-vmm.log" 2>/dev/null
-                   cp "$D/console.log" "$out/scale-console.log" 2>/dev/null; }
+  [ -d "$D" ] && { cp "$D/vmm.log" "$out/scale-$M-vmm.log" 2>/dev/null
+                   cp "$D/console.log" "$out/scale-$M-console.log" 2>/dev/null; }
   sh "$here/tools/mvm" stop --name "$M" >/dev/null 2>&1
   rm -rf "$D"; docker context rm "mvm-$M" >/dev/null 2>&1
-  [ "$fail" = 0 ] || echo "  (the machine's logs are in $out/scale-vmm.log and scale-console.log)"
+  [ "$fail" = 0 ] || echo "  (the machine's logs are in $out/scale-$M-vmm.log and scale-$M-console.log)"
 }
 trap cleanup EXIT
 ms() { python3 -c 'import time;print(int(time.time()*1000))'; }

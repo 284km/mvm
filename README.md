@@ -556,12 +556,55 @@ container — `MZ\0\0zimg`, a gzip payload at a stated offset — so it is not a
 `gunzip` either. Both facts belong to whoever builds their own.)
 
 **`build` makes the rest**: the host's four (`mvm-boot`, `mkdtb`, `mports`,
-`mproxy`, the first two signed) and the guest's three (`mengd`, `mrun`, `mfwd`,
-static). The guest's land in `.build/guest/`, so **a machine can be started
-from this directory alone** — `MENGD_SRC` and `MRUN_SRC` are how they get
-built, not how they get used. It does not use `docker build`: the legacy
-builder in the Docker CLI on macOS hangs against any daemon, real ones
-included, and a tool that hangs while building itself is worse than a slow one.
+`mproxy`, the first two signed), the guest's three (`mengd`, `mrun`, `mfwd`,
+static), and the initramfs that makes a disk. The guest's land in
+`.build/guest/`, so **a machine can be started from this directory alone** —
+`MENGD_SRC` and `MRUN_SRC` are how they get built, not how they get used. It
+does not use `docker build`: the legacy builder in the Docker CLI on macOS
+hangs against any daemon, real ones included, and a tool that hangs while
+building itself is worse than a slow one.
+
+## The guest makes its own disk
+
+Everything about shipping this was easy except one thing. 25 MB compressed; an
+adhoc signature that survives a tarball, since it carries no identity. (And the
+signature is not what to check: the linker on arm64 macOS ad-hoc signs
+everything, so removing the `codesign` step leaves a binary that is still
+"signed" and has lost the **entitlement** — that is the half that can go
+missing, and the half Hypervisor.framework asks for.) And then the root
+filesystem was built by `docker create` for the tree and a container running
+`mke2fs` for the filesystem — so **a tool that replaces docker needed docker to
+install**, on a system that has nothing else that writes ext4.
+
+It does not have to be built on the host. The guest has a kernel with ext4 in
+it, so the host only makes a file of the right size — that is `dd` — and one
+boot of `initrd-format.gz` does the rest: `mke2fs`, copy its own userspace in,
+install `/sbin/init` and the payload, power off. About **four seconds, once**.
+
+**It powers off rather than `switch_root`.** The running path — `root=/dev/vda
+init=/sbin/init` — is the one every check here is green against, and a second
+way to reach it would be a second thing to keep working.
+
+**A rebuilt tool installs itself.** The initramfs carries the daemon and the
+runtime, and `start` records its digest beside the disk; when they differ it
+boots the formatter in `refresh` mode, which copies the programs in and leaves
+the filesystem alone. Before that, upgrading meant deleting the machine. The
+initramfs is built from a pipe, so gzip stores no timestamp and the same inputs
+give the same bytes — which is what makes "has this changed" a comparison
+rather than a guess, and what stops an ordinary restart from doing any of this.
+
+`tools/mkrootfs.sh` is still here and still needs docker. It builds a disk from
+a particular image with a particular payload, which several checks want before
+there is a machine; it is not how a machine is installed any more.
+
+**What a person needs: macOS on Apple silicon.** Not docker, not Mere. A
+downloaded release is quarantined, and a quarantined VMM does not fail — it
+**hangs**, with a dialog somewhere. `doctor` names it before `start` can reach
+it. (`spctl` is no use as the check: it reports `rejected` for every adhoc
+signature, including one that runs perfectly.)
+
+`test/build.sh` is the check, and its last section is the point: it takes
+docker off the `PATH` and starts a machine.
 
 ## Starting one
 
