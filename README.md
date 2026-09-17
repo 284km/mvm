@@ -255,19 +255,34 @@ deadline had to work before the poisons meant anything.
 
 ## What it does not do
 
-One virtio device and one queue. Indirect descriptors are not offered, so a
-driver cannot ask for them; `VIRTIO_BLK_T_FLUSH` is answered as unsupported,
-which is honest for a device with no write cache of its own. A request whose
-descriptor chain is not the shape the specification requires is answered
-`VIRTIO_BLK_S_UNSUPP` rather than guessed at. See `DESIGN-virtio.md`.
+*This section was wrong for a while, which is worse than it being short.* It
+still said one virtio device, no port mapping and one inward path after all
+three had stopped being true — and the rest of this file described the ports it
+denied. A reader believes the document over the code, so a stale limit sends
+the next person off to build something that is already here.
 
-No network and no SMP, and no console input: PSCI answers `NOT_SUPPORTED` to
-everything except the two calls that end the machine. There *is* a way in and out of
-the VM — virtio-vsock, whose host end is a unix socket, in both directions —
-but no port mapping: one inward path to one guest port. See `DESIGN-vsock.md`. System registers this VMM does not emulate read as zero
-and drop writes, which is what every VMM does with the debug and trace
-registers a kernel touches on the way up, and is also a place where a guest
-could be quietly misled.
+**Two virtio devices**: block (one queue) and vsock (three — rx, tx, event).
+Indirect descriptors are not offered, so a driver cannot ask for them;
+`VIRTIO_BLK_T_FLUSH` is answered as unsupported, which is honest for a device
+with no write cache of its own. A request whose descriptor chain is not the
+shape the specification requires is answered `VIRTIO_BLK_S_UNSUPP` rather than
+guessed at. See `DESIGN-virtio.md`.
+
+**No network interface**, and that one is load-bearing: the guest has no NIC at
+all, by design. Everything in and out goes through virtio-vsock — published
+ports (static and dynamic, both directions), the docker socket, the registry,
+the proxy. It is also why there is no NAT: there is nothing to translate *to*,
+and the three ways to change that are written down in the design notes rather
+than half-built.
+
+**No SMP and no console input.** PSCI answers `NOT_SUPPORTED` to everything
+except the two calls that end the machine. One vCPU is not a performance
+problem as far as anything here has measured: `docker run --rm alpine echo`
+takes 418 ms against colima's 428, and `docker ps` 90 ms against 105.
+
+System registers this VMM does not emulate read as zero and drop writes, which
+is what every VMM does with the debug and trace registers a kernel touches on
+the way up, and is also a place where a guest could be quietly misled.
 
 ## Two things the integration said that nothing before it could
 
@@ -397,13 +412,17 @@ it opens and closes host ports, and who wanted one is the caller's business.
 
 ## What is next
 
-**More than one machine's worth.** One guest, one docker socket, one set of
-ports. Two VMs would need the control socket to say which — and that is the
-first thing here that would benefit from a name rather than a number.
+*Two things this section used to predict have happened, and neither happened
+the way it said.* **A second machine** was expected to need the control socket
+to say which machine it meant; every path turned out to be an argument or an
+environment variable already, so the work was a check rather than a change —
+`test/two.sh`. **`docker build`** was listed as absent; it builds, caches, and
+writes one layer per step now.
 
-**More than one machine's worth**, and **`docker build`**. The stack pulls,
-runs, publishes ports and answers compose; it cannot build an image, and
-`POST /build` says so by name.
+What is actually left is in the design notes: a single command to bring a
+machine up (today it is six pieces assembled by hand), and outbound NAT, which
+is not an omission but a request with no meaning on a machine that has no
+upstream interface.
 
 The language change this project expected never arrived. `Raw`, Mere's window
 type for physical memory, was going to need a second source so that a virtio
