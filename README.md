@@ -518,3 +518,47 @@ A gate that cannot tell "the daemon is broken" from "the client is broken"
 would hang, and a hang says nothing at all. The build path itself is still
 checked where the client is Linux and the legacy builder works — that is
 mengd's own gate, with COPY, ADD, the cache and one layer per step.
+
+## Starting one
+
+```
+MENGD_SRC=… MRUN_SRC=… sh tools/mvm start [--name N] [--disk-size MiB] [-p HOST:GUEST]
+sh tools/mvm status
+sh tools/mvm stop
+sh tools/mvm doctor
+```
+
+Everything it does was already possible; it was six pieces assembled by hand,
+and that is the difference between "the stack works" and "somebody uses it".
+State lives in one directory per machine (`$MVM_HOME/<name>`, default
+`~/.mvm/<name>`) — the second machine is not a special case, since two of them
+already run side by side.
+
+**`doctor` names what is missing**, one line each: the kernel, the modules, the
+guest's daemon and runtime, the signature Hypervisor.framework requires. "It
+did not start" is not one of those sentences.
+
+**A stop has to be a stop.** Killing the VMM loses whatever the guest has not
+committed yet: a machine stopped a second after a container was created came
+back *without it*. `stop` asks the daemon to flush and power the machine off —
+`POST /_shutdown`, spelt with an underscore like `/_ping` so it cannot be
+mistaken for part of the Docker API — and the VMM sees the same PSCI
+`SYSTEM_OFF` a guest sends when its init finishes. Only if that does not happen
+does it signal, and then escalate.
+
+**No deadline.** `MENGD_SECONDS` and `MVM_TIMEOUT_MS` were 180 s and 20 s by
+default, which was right while every run of this was a test and wrong the
+moment a person started one. Both are opt-in now, and the checks name the
+number they want.
+
+**cgroup v2 is mounted in the guest.** Without it a container has no cgroup of
+its own — no limit, nothing to measure, nothing to freeze — and the runtime
+said so into the container's own stderr, where a person running `docker run`
+saw a warning about the machine instead of their output.
+
+`test/lifecycle.sh` is the check: start, put things in, stop, start again, and
+ask what is there. It is the first check here that cares about **what
+survives** — every other one builds a machine, uses it and throws it away.
+Poisoned by killing the VMM without asking, five of its checks go red; poisoned
+by skipping the daemon's reconciliation, the container comes back claiming to
+be running.

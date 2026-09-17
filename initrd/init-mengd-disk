@@ -8,6 +8,12 @@ mkdir -p /dev /proc /sys 2>/dev/null
 mount -t devtmpfs dev /dev 2>/dev/null
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
+# cgroup v2. Without it a container has no cgroup of its own, which is three
+# things at once -- no limit, nothing to measure, nothing to freeze -- and the
+# runtime says so on every start, into the container's own stderr where the
+# person running it sees a warning about the machine instead of their output.
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null
 say() { echo "userspace: $1" > /dev/kmsg; }
 say "init-mengd-disk starting on $(mount | grep ' / ' | head -1)"
 
@@ -38,6 +44,11 @@ done
 # What the kernel says it has, not what insmod appeared to do. The daemon
 # cannot make a bridge or a veth pair without these, and "the module is not
 # here" and "the call was refused" look identical from where the daemon sits.
+if [ -w /sys/fs/cgroup/cgroup.procs ]; then
+  say "cgroup v2 is mounted"
+else
+  say "no cgroup v2: containers cannot be limited, measured or frozen"
+fi
 if [ -d /sys/module/bridge ] && [ -d /sys/module/veth ]; then
   say "bridge and veth are in the kernel"
 else
@@ -123,7 +134,15 @@ say "mengd started on vsock port 1024"
 
 
 i=0
-while [ "$i" -lt "${MENGD_SECONDS:-180}" ]; do sleep 1; i=$((i+1)); done
+# NO DEADLINE UNLESS ONE WAS ASKED FOR. A machine somebody is using should run
+# until it is told to stop; 180 seconds was the right default while every run
+# of this was a test, and the wrong one the moment a person started it. The
+# checks pass MENGD_SECONDS and get exactly the bounded run they need.
+if [ -z "${MENGD_SECONDS:-}" ]; then
+  say "no deadline: this machine runs until it is stopped"
+  while true; do sleep 3600; done
+fi
+while [ "$i" -lt "$MENGD_SECONDS" ]; do sleep 1; i=$((i+1)); done
 say "init-mengd-disk done"
 sync
 poweroff -f

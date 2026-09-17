@@ -209,7 +209,11 @@ let boot = fn (image: str) -> fn (dtb: str) -> fn (initrd: str) -> fn (disk: str
   // tested, because the test hangs with it.
   // The deadline runs on its own thread and forces the vCPU out of the
   // framework's run(), because a guest in WFI never comes back on its own.
-  let _ = hv_start_deadline (int_or (env_or "MVM_TIMEOUT_MS") 20000) in
+  // 20 seconds was the right default while every run was a check; a machine
+  // somebody started is not on a timer. 0 means no deadline, and the checks
+  // name the number they want.
+  let _ = hv_start_deadline (let t = env_or "MVM_TIMEOUT_MS" in
+                             if str_len t == 0 then 0 else int_or t 20000) in
   let rec run = fn (n: int) -> fn (out: int) ->
     if hv_deadline_fired () == 1 then
       let _ = print_err ("mvm: gave up at the deadline after " ++ show n ++ " exits"
