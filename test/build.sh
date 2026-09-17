@@ -56,6 +56,40 @@ else
   echo "  SKIP  no route to ports.ubuntu.com -- the kernel step needs one"
 fi
 
+echo "== or one built here =="
+# OPT-IN, because it is five minutes. What it buys is that there are no modules
+# at all -- kernel/config.fragment is nine lines on top of arm64 defconfig --
+# and the thing to check is that the capabilities are there without any file to
+# load. The guest is asked, because the guest is what has to have them.
+if [ "${KERNEL_SOURCE:-0}" = 1 ]; then
+  sh "$here/tools/mvm" build --kernel --from-source > "$out/build-ksrc.log" 2>&1
+  say $? "mvm build --kernel --from-source"
+  [ "$(awk '/^modules /{print $2}' "$out/kernel.lock")" = built-in ]
+  say $? "it records that the modules are built in"
+  [ "$(ls "$out"/extra/*.ko 2>/dev/null | wc -l | tr -d ' ')" = 0 ]
+  say $? "and there are no modules left to ship"
+  sh "$here/tools/mkinitrd.sh" > "$out/build-ksrc-initrd.log" 2>&1
+  grep -q "no modules to carry" "$out/build-ksrc-initrd.log"
+  say $? "the initramfs carries none either"
+  K="ks$$"
+  env PATH=/usr/bin:/bin:/usr/sbin:/sbin MVM_HOME="$MVM_HOME" \
+      sh "$here/tools/mvm" start --name "$K" --disk-size 1024 > "$out/build-ksrc-start.log" 2>&1
+  # THE CAPABILITY, ASKED OF THE GUEST. /sys/module was the wrong question: a
+  # built-in veth leaves nothing there, and the check that used it called a
+  # working machine broken.
+  grep -q "bridge and veth are in the kernel" "$out/build-ksrc-start.log"
+  say $? "the guest has bridge and veth with nothing loaded"
+  grep -q "overlay mounts" "$out/build-ksrc-start.log"
+  say $? "and overlayfs"
+  sh "$here/tools/mvm" stop --name "$K" >/dev/null 2>&1
+  rm -rf "$MVM_HOME/$K"; docker context rm "mvm-$K" >/dev/null 2>&1
+  # Put the pinned one back: it is the default, and the checks after this one
+  # are about what a release contains.
+  sh "$here/tools/mvm" build --kernel >/dev/null 2>&1
+else
+  echo "  SKIP  KERNEL_SOURCE=1 builds a kernel from source (about five minutes)"
+fi
+
 echo "== everything else =="
 sh "$here/tools/mvm" build > "$out/build-all.log" 2>&1
 say $? "mvm build"

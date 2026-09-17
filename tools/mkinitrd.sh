@@ -24,10 +24,16 @@ for n in mengd mrun mfwd; do
   [ -x "$src" ] || { echo "mkinitrd: no $n -- run mvm build first" >&2; exit 1; }
   cp "$src" "$pl/opt/$n"
 done
-for m in "$b"/extra/*.ko; do
-  [ -r "$m" ] || { echo "mkinitrd: no kernel modules -- run mvm build --kernel first" >&2; exit 1; }
-  cp "$m" "$pl/opt/"
-done
+# The modules, when the kernel needs any. A kernel built here has them in it
+# and there is nothing to carry -- which is the whole reason for building it.
+if [ "$(awk '/^modules /{print $2}' "$b/kernel.lock" 2>/dev/null)" = built-in ]; then
+  echo "mkinitrd: the kernel has them built in; no modules to carry"
+else
+  for m in "$b"/extra/*.ko; do
+    [ -r "$m" ] || { echo "mkinitrd: no kernel modules -- run mvm build --kernel first" >&2; exit 1; }
+    cp "$m" "$pl/opt/"
+  done
+fi
 cp "$here/initrd/init-format" "$pl/init"
 cp "$here/initrd/init-mengd-disk" "$pl/init-mengd-disk"
 chmod 755 "$pl/init" "$pl/opt"/mengd "$pl/opt"/mrun "$pl/opt"/mfwd

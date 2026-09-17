@@ -547,6 +547,28 @@ The pin is exact, and that is the point: the Image it produces has sha256
 `ce3cccaf…450e`, **byte for byte the kernel every check here has been green
 against**. Obtaining it this way is not a new kernel to re-validate.
 
+**`build --kernel --from-source` builds one instead**, from a kernel.org
+tarball pinned by digest, with `kernel/config.fragment` on top of arm64
+`defconfig`. That fragment is **nine lines** — measured, not guessed: every
+other thing this machine needs, `defconfig` already has. What the nine buy is
+that **there are no modules at all**: no eight files beside the Image, no
+version that has to match it, no `insmod` at boot. 287 seconds on six cores,
+and an Image of 44.5 MB against the package's 59.
+
+It is not the default. The package path produces an Image whose sha256 is
+`ce3cccaf…450e` every time — an external oracle, and the kernel every check
+here has been green against — while a kernel build stamps itself and is not
+byte-reproducible. Both are checked; `KERNEL_SOURCE=1 sh test/build.sh` runs
+the second.
+
+**Finding a capability is not finding a module.** The guest used to report what
+it could do by looking in `/sys/module`, which is right for four of these and
+wrong for the one that matters: a built-in `veth` leaves nothing there at all,
+while `bridge`, `overlay` and `vsock` do. So a machine whose containers were
+reaching each other perfectly announced "no bridge/veth: containers will have
+no way to reach each other". It makes a veth pair and deletes it now, and
+mounts an overlay and unmounts it — the capability, asked in its own terms.
+
 Alpine's `linux-virt` is half the download and was measured and set aside for
 one reason: `CONFIG_VIRTIO_MMIO=m`, `CONFIG_VIRTIO_BLK=m`, `CONFIG_EXT4_FS=m`.
 A kernel whose virtio and ext4 are modules cannot mount `root=/dev/vda` without

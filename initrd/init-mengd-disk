@@ -27,10 +27,14 @@ say "clock says $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   && say "the amba bus enumerated 9010000.pl031" \
   || say "no pl031 on the amba bus"
 
+# A KERNEL BUILT HERE HAS THESE IN IT, and then there is no file to load. Only
+# a module that is PRESENT and refuses is worth a line: the version that said
+# "insmod vsock FAILED" on a kernel with vsock built in was reporting the
+# absence of a file as the absence of a capability.
 for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport; do
-  insmod /opt/$m.ko 2>/dev/null || say "insmod $m FAILED"
+  [ -r /opt/$m.ko ] && { insmod /opt/$m.ko 2>/dev/null || say "insmod $m FAILED"; }
 done
-say "vsock modules loaded"
+say "vsock is $([ -d /sys/module/vsock ] && echo present || echo MISSING)"
 
 # A network between containers: a bridge, and a veth pair per container. Both
 # are =m in a stock kernel, and bridge wants the spanning-tree and LLC modules
@@ -49,10 +53,26 @@ if [ -w /sys/fs/cgroup/cgroup.procs ]; then
 else
   say "no cgroup v2: containers cannot be limited, measured or frozen"
 fi
-if [ -d /sys/module/bridge ] && [ -d /sys/module/veth ]; then
+# WHAT THE KERNEL CAN DO, not how it came to be able to.
+#
+# /sys/module was the wrong question. A kernel built for this machine has these
+# in it rather than beside it, and a built-in veth leaves NOTHING in
+# /sys/module -- while bridge, overlay and vsock do. So the module-shaped check
+# was right about three of four and reported "containers will have no way to
+# reach each other" on a machine where they reached each other perfectly.
+#
+# A veth pair is cheap to make and cheap to destroy, and making one is the
+# capability itself.
+if ip link add name mvmprobe0 type veth peer name mvmprobe1 2>/dev/null; then
+  ip link del mvmprobe0 2>/dev/null
+  vok=yes
+else
+  vok=no
+fi
+if [ -d /sys/module/bridge ] && [ "$vok" = yes ]; then
   say "bridge and veth are in the kernel"
 else
-  say "no bridge/veth: containers will have no way to reach each other"
+  say "no bridge/veth: containers will have no way to reach each other (bridge=$([ -d /sys/module/bridge ] && echo yes || echo no) veth=$vok)"
 fi
 
 # overlayfs. A build step's layer IS the upper directory of an overlay mount,
@@ -62,16 +82,16 @@ fi
 # Said out loud at boot rather than discovered at build time: the module being
 # absent and the mount being refused produce the same symptom hours later, and
 # this is the only place that can tell them apart.
-if [ -r /opt/overlay.ko ]; then
-  insmod /opt/overlay.ko 2>/dev/null || say "insmod overlay FAILED"
-  mkdir -p /run/ovl/l /run/ovl/u /run/ovl/w /run/ovl/m
-  if mount -t overlay overlay -o lowerdir=/run/ovl/l,upperdir=/run/ovl/u,workdir=/run/ovl/w /run/ovl/m 2>/dev/null; then
-    umount /run/ovl/m; say "overlay mounts"
-  else
-    say "overlay module loaded but mount FAILED"
-  fi
+# THE MOUNT IS THE QUESTION, and it is asked whether or not there was a module
+# to load: a kernel with overlayfs built in has no /opt/overlay.ko, and the
+# version that looked for the file said "builds will write one flat layer"
+# about a machine that mounts overlays all day.
+[ -r /opt/overlay.ko ] && { insmod /opt/overlay.ko 2>/dev/null || say "insmod overlay FAILED"; }
+mkdir -p /run/ovl/l /run/ovl/u /run/ovl/w /run/ovl/m
+if mount -t overlay overlay -o lowerdir=/run/ovl/l,upperdir=/run/ovl/u,workdir=/run/ovl/w /run/ovl/m 2>/dev/null; then
+  umount /run/ovl/m; say "overlay mounts"
 else
-  say "no overlay.ko: builds will write one flat layer"
+  say "overlay does NOT mount: builds will write one flat layer"
 fi
 
 # A container runtime needs these to exist inside the container's own view.

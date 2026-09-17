@@ -31,6 +31,13 @@
 # gunzip either. Both facts belong to whoever tries option 3: building it.)
 #
 #   sh tools/mkkernel.sh [--version V] [--from-dir DIR] [--image IMG]
+#   sh tools/mkkernel.sh --from-source [--kversion 6.8]
+#
+# --from-source builds one instead, from kernel.org, with kernel/config.fragment
+# on top of arm64 defconfig. That fragment is NINE lines, and what it buys is
+# that there are no modules at all: no eight files to ship beside the Image, no
+# version that has to match it, no insmod at boot. Measured: 287 seconds on six
+# cores, and an Image of 44.5 MB against the package's 59.
 #
 # --from-dir takes .deb files that are already on this machine, for the day the
 # archive stops carrying this version. That day is coming: the package lives in
@@ -41,11 +48,18 @@ out="$here/.build"
 VER="6.8.0-117-generic"
 FROM=""
 IMG="ubuntu:24.04"
+SOURCE=0
+KVER="6.8"
+# The tarball this pins to. A digest rather than a version, because a version
+# is a name and a name can be republished.
+KSHA="c969dea4e8bb6be991bbf7c010ba0e0a5643a3a8d8fb0a2aaa053406f1e965f3"
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VER="$2"; shift 2;;
     --from-dir) FROM="$(cd "$2" && pwd)"; shift 2;;
     --image) IMG="$2"; shift 2;;
+    --from-source) SOURCE=1; shift;;
+    --kversion) KVER="$2"; KSHA=""; shift 2;;
     *) echo "mkkernel: unknown option $1" >&2; exit 2;;
   esac
 done
@@ -56,6 +70,39 @@ W="$out/kernel-work"
 # The eight. Each one is named because each one is a capability, and a kernel
 # missing one is a machine that does a little less without saying so.
 MODS="vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport overlay veth bridge stp llc"
+
+if [ "$SOURCE" = 1 ]; then
+  echo "mkkernel: building linux-$KVER from source (about five minutes on six cores)"
+  [ -r "$here/kernel/config.fragment" ] || { echo "mkkernel: no kernel/config.fragment" >&2; exit 1; }
+  mkdir -p "$W"
+  # THE FRAGMENT GOES IN AS A FILE, not as a list inside this script: it is the
+  # whole description of what this machine needs, and it has to be readable
+  # without reading a shell script.
+  cp "$here/kernel/config.fragment" "$W/fragment"
+  cp "$here/kernel/build.sh" "$W/build.sh"
+  docker run --rm -v "$W:/o" "$IMG" sh /o/build.sh "$KVER" "${KSHA:--}" /o/fragment /o \
+    || { echo "mkkernel: the kernel did not build" >&2; exit 1; }
+  [ -r "$W/Image" ] || { echo "mkkernel: no Image came out" >&2; exit 1; }
+  [ "$(od -An -c -j56 -N4 "$W/Image" | tr -d ' \n')" = "ARMd" ] \
+    || { echo "mkkernel: that is not an arm64 Image" >&2; exit 1; }
+  mv "$W/Image" "$out/Image"
+  cp "$W/config" "$out/kernel.config"
+  # NO MODULES. That is the whole point of building it, so the old ones are
+  # taken away rather than left to be loaded into a kernel they do not match.
+  rm -f "$out"/extra/*.ko
+  {
+    echo "# what .build/Image was made from"
+    echo "version linux-$KVER (built here)"
+    echo "source  kernel.org, with kernel/config.fragment on arm64 defconfig"
+    echo "modules built-in"
+    [ -n "$KSHA" ] && echo "$KSHA  linux-$KVER.tar.xz"
+    cat "$W/Image.sha256" 2>/dev/null
+  } > "$out/kernel.lock"
+  rm -rf "$W"
+  echo "mkkernel: $(wc -c < "$out/Image" | tr -d ' ') bytes of kernel, and no modules to ship"
+  sed -n '2,9p' "$out/kernel.lock" | sed 's/^/  /'
+  exit 0
+fi
 
 if [ -n "$FROM" ]; then
   echo "mkkernel: using the .deb files in $FROM"
@@ -125,6 +172,7 @@ done
   echo "# what .build/Image and .build/extra/*.ko were made from"
   echo "version $VER"
   echo "source  ${FROM:-ubuntu archive ($IMG)}"
+  echo "modules from-package"
   cat "$W/packages.sha256" 2>/dev/null
   cat "$W/Image.sha256" 2>/dev/null
 } > "$out/kernel.lock"

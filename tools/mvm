@@ -6,7 +6,7 @@
 # it". The pieces are a guest disk, a device tree, the VMM, the port watcher,
 # and a docker client pointed at the right socket.
 #
-#   mvm build [--kernel]
+#   mvm build [--kernel [--from-source]]
 #   mvm start [--name N] [--disk-size MiB] [--ram MB] [-p HOST:GUEST]...
 #             [--proxy-port P | --no-proxy]
 #   mvm stop  [--name N]
@@ -39,6 +39,8 @@ USE_PROXY=1
 KERNEL_ONLY=0
 KVER=""
 KDIR=""
+KSRC=0
+KKVER=""
 
 usage() {
   sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
@@ -58,6 +60,8 @@ while [ $# -gt 0 ]; do
     --kernel) KERNEL_ONLY=1; shift;;
     --version) KVER="$2"; shift 2;;
     --from-dir) KDIR="$2"; shift 2;;
+    --from-source) KSRC=1; shift;;
+    --kversion) KKVER="$2"; shift 2;;
     *) echo "mvm: unknown option $1" >&2; usage;;
   esac
 done
@@ -90,9 +94,17 @@ doctor() {
   chk "the way out (a CONNECT proxy)" "$out/mproxy" "same -- without it nothing inside can reach the network"
   chk "the initramfs that makes a disk" "$out/initrd-format.gz" "sh tools/mkinitrd.sh -- the guest formats its own disk, because macOS cannot write ext4"
 
-  for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport overlay veth bridge stp llc; do
-    chk "module $m.ko" "$out/extra/$m.ko" "from /lib/modules/\$(uname -r) of THAT kernel; each one missing costs a feature"
-  done
+  # EIGHT FILES, OR A KERNEL THAT NEEDS NONE. Which it is comes from
+  # kernel.lock, because the difference is a property of how the Image was
+  # made: one taken out of a package is built for somebody else's machine and
+  # has these as modules; one built here has them in it.
+  if [ "$(awk '/^modules /{print $2}' "$out/kernel.lock" 2>/dev/null)" = built-in ]; then
+    echo "  ok    the kernel has overlay, vsock, bridge and veth built in (no modules to ship)"
+  else
+    for m in vsock vmw_vsock_virtio_transport_common vmw_vsock_virtio_transport overlay veth bridge stp llc; do
+      chk "module $m.ko" "$out/extra/$m.ko" "from /lib/modules/\$(uname -r) of THAT kernel; each one missing costs a feature"
+    done
+  fi
   # THIS DIRECTORY FIRST. `mvm build` puts them in .build/guest, so a machine
   # can be started from here alone; a checkout next door is how they get built,
   # not how they get used.
@@ -314,6 +326,8 @@ status() {
 build() {
   if [ "$KERNEL_ONLY" = 1 ]; then
     set --
+    [ "$KSRC" = 1 ] && set -- "$@" --from-source
+    [ -n "$KKVER" ] && set -- "$@" --kversion "$KKVER"
     [ -n "$KVER" ] && set -- "$@" --version "$KVER"
     [ -n "$KDIR" ] && set -- "$@" --from-dir "$KDIR"
     sh "$here/tools/mkkernel.sh" "$@"

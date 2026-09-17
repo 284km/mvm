@@ -1,0 +1,38 @@
+# kernel/config.fragment — what this machine needs that arm64 defconfig does not
+# give, and nothing else.
+#
+# WHY THERE IS A LIST AT ALL. Everything else here is built from source; the
+# kernel was taken out of somebody's package, which works and means the machine
+# is defined by a distribution's choices. Those choices are visible in exactly
+# one way: which drivers are modules. Eight files had to be shipped beside the
+# Image, kept at the same version as it, and insmod'ed in dependency order at
+# boot -- because the kernel was built for a machine that is not this one.
+#
+# Built here, the list below is the whole difference. Measured against
+# `make ARCH=arm64 defconfig` for 6.8: everything not named here was already
+# right, including PL011, PSCI, virtio-mmio, virtio-blk, ext4, devtmpfs, every
+# namespace, cgroup v2 with memory and pids and freezer, initrd and seccomp.
+#
+# Each line is a capability, and the whole list is nine.
+
+# A container's root filesystem is an overlay over the image's one copy.
+CONFIG_OVERLAY_FS=y
+
+# The only way in or out of this machine: it has no network interface, and the
+# VMM carries the docker socket and every published port over vsock.
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
+
+# A network between containers: a bridge, and a veth pair each. The bridge
+# wants the spanning-tree and LLC code under it.
+CONFIG_VETH=y
+CONFIG_BRIDGE=y
+CONFIG_STP=y
+CONFIG_LLC=y
+
+# `docker run --cpus`. Without it cpu.max does not exist and a limit somebody
+# wrote down is silently not applied.
+CONFIG_CFS_BANDWIDTH=y
+
+# Containers get a v6 address on the same network, from a unique-local prefix.
+CONFIG_IPV6=y
