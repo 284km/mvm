@@ -113,6 +113,11 @@ r=$(python3 "$here/test/socks_probe.py" 127.0.0.1 "$port" 2 example.com 443 2>/d
 [ "$r" = "0 7" ]; say $? "a command it does not implement is refused BY CODE, not by hanging ($r)"
 r=$(python3 "$here/test/socks_probe.py" 127.0.0.1 "$port" 1 no-such-host.invalid 443 2>/dev/null)
 [ "$r" = "0 4" ]; say $? "and a name that does not exist says so ($r)"
+# CHOSEN FROM WHAT WAS OFFERED, not announced. A server that answers "no
+# authentication" to a client which never offered it leaves that client to fail
+# further on with nothing to read; 0xFF is the specification's way to say it.
+r=$(python3 "$here/test/socks_probe.py" 127.0.0.1 "$port" 1 example.com 443 2 2>/dev/null)
+[ "$r" = "255 -" ]; say $? "a client offering only a method it does not have gets 0xFF ($r)"
 if [ "$apk" = 0 ]; then
   o=$(docker run --rm alpine:latest sh -c 'apk add --no-cache curl >/dev/null 2>&1;
       curl -s -o /dev/null -w "%{http_code}" --max-time 25 --socks5-hostname '"$gw"':'"$port"' https://example.com/' 2>/dev/null | tr -d '\r')

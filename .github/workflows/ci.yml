@@ -48,8 +48,10 @@ jobs:
       # An option that is merely undocumented breaks no test: it works for
       # everyone who already knows it exists. `mvm --help` was extracted by
       # line number, so documenting one new option pushed `mvm status` and
-      # `mvm doctor` off the end of the help and nothing noticed.
-      - name: The usage names everything the tool accepts
+      # `mvm doctor` off the end of the help and nothing noticed. Two questions:
+      # every tools/ script's parser against its own header, and what mvm's
+      # help actually PRINTS -- the second is the one that catches truncation.
+      - name: Every option a tool accepts is documented, and mvm prints them
         if: ${{ !cancelled() }}
         run: sh tools/checkopts.sh
 

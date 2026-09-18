@@ -192,10 +192,25 @@ let serve_socks = fn (c: int) ->
   if str_len g < 4 then (let _ = px_close c in ())
   else
     let nmeth = hbyte g 1 in
-    let _ = if nmeth > 0 then (let _ = px_read_hex c nmeth in ()) else () in
-    // No authentication. This listens on the loopback and the only thing on
-    // the other side is the machine this host started; a password here would
-    // be a secret shared with oneself.
+    let meths = if nmeth > 0 then px_read_hex c nmeth else "" in
+    // No authentication -- but only if the client OFFERED it. This listens on
+    // the loopback and the only thing on the other side is the machine this
+    // host started, so a password here would be a secret shared with oneself;
+    // that is why 0x00 is the method. Answering 0x00 to a client that did not
+    // offer it is a different thing: the specification says choose from what
+    // was offered or say 0xFF, and a server that picks anyway leaves the
+    // client to fail somewhere further on with nothing to read.
+    let rec has_none = fn (i: int) ->
+      if i >= nmeth then 0
+      else if hbyte meths i == 0 then 1
+      else has_none (i + 1) in
+    if str_len meths < nmeth * 2 then (let _ = px_close c in ())
+    else if has_none 0 == 0 then
+      let _ = if tracing () then
+                print_err ("mproxy: socks refused -- no acceptable method in " ++ meths) else () in
+      let _ = px_write_hex c "05ff" in
+      let _ = px_close c in ()
+    else
     let _ = px_write_hex c "0500" in
     let r = px_read_hex c 4 in
     if str_len r < 8 then (let _ = px_close c in ())
