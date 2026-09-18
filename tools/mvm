@@ -6,10 +6,11 @@
 # it". The pieces are a guest disk, a device tree, the VMM, the port watcher,
 # and a docker client pointed at the right socket.
 #
-#   mvm build [--kernel [--from-source]]
+#   mvm build [--kernel [--version V | --from-dir DIR]
+#                       [--from-source [--kversion 6.8]]]
 #   mvm package
 #   mvm start [--name N] [--disk-size MiB] [--ram MB] [--cpus N]
-#             [-p HOST:GUEST]... [--proxy-port P | --no-proxy]
+#             [-p|--publish HOST:GUEST]... [--proxy-port P | --no-proxy]
 #             [--proxy-everywhere]
 #   mvm stop  [--name N]
 #   mvm status [--name N]
@@ -60,7 +61,17 @@ KSRC=0
 KKVER=""
 
 usage() {
-  sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'
+  # BY CONTENT, NOT BY LINE NUMBER. This was `sed -n '3,14p'`, and adding one
+  # line to the block above silently pushed `mvm status` and `mvm doctor` off
+  # the end of the help -- the tool still accepted them and stopped saying so.
+  # Here the block ends where it actually ends: the first bare `#` after the
+  # command list. tools/checkopts.sh is the check that nothing is accepted
+  # without being named here.
+  awk 'NR < 3 { next }
+       /^#   mvm /  { seen = 1 }
+       seen && /^#$/ { exit }
+       /^#/ { sub(/^#[ ]?/, ""); print; next }
+       { exit }' "$0"
   exit 2
 }
 
@@ -119,6 +130,26 @@ doctor() {
   rc=0
   IRD="$(ird_list)"
   chk() { if [ -r "$2" ] || [ -x "$2" ]; then echo "  ok    $1"; else echo "  MISSING $1 -- $3"; rc=1; fi; }
+
+  # THE MACHINE THIS IS RUNNING ON, FIRST, because it is the one thing here
+  # that cannot be fixed by building something. The interrupt controller is
+  # hv_gic_create and the eight calls around it, all API_AVAILABLE(macos(15.0));
+  # on macOS 14 the loader refuses the VMM for a missing symbol before it can
+  # say anything of its own, and the person reading that has no way to know
+  # what it means. Said here instead, once, in a sentence.
+  echo "== the machine this is running on =="
+  osv="$(sw_vers -productVersion 2>/dev/null)"
+  arch="$(uname -m 2>/dev/null)"
+  case "$arch" in
+    arm64) echo "  ok    Apple silicon ($arch)";;
+    *)     echo "  MISSING Apple silicon -- this is $arch, and the guest is arm64"; rc=1;;
+  esac
+  case "${osv%%.*}" in
+    ''|*[!0-9]*) echo "  MISSING a macOS version -- sw_vers said '${osv:-nothing}'"; rc=1;;
+    *) if [ "${osv%%.*}" -ge 15 ]; then echo "  ok    macOS $osv (15.0 or newer, which hv_gic_* needs)"
+       else echo "  MISSING macOS 15.0 or newer -- this is $osv, and hv_gic_create does not exist before 15.0"; rc=1; fi;;
+  esac
+
   echo "== what a machine is made of =="
   chk "an arm64 kernel Image"      "$out/Image"     "gunzip -c /boot/vmlinuz-\$(uname -r) > .build/Image, on a Linux box with that kernel"
   chk "the VMM"                    "$VMM"           "sh test/stack.sh builds it, or build boot.mere yourself"

@@ -100,7 +100,7 @@ if [ "$SOURCE" = 1 ]; then
   } > "$out/kernel.lock"
   rm -rf "$W"
   echo "mkkernel: $(wc -c < "$out/Image" | tr -d ' ') bytes of kernel, and no modules to ship"
-  sed -n '2,9p' "$out/kernel.lock" | sed 's/^/  /'
+  sed -n '2,$p' "$out/kernel.lock" | sed 's/^/  /'
   exit 0
 fi
 
@@ -178,4 +178,4 @@ done
 } > "$out/kernel.lock"
 rm -rf "$W"
 echo "mkkernel: $(wc -c < "$out/Image" | tr -d ' ') bytes of kernel and $(ls "$out/extra"/*.ko | wc -l | tr -d ' ') modules"
-sed -n '2,9p' "$out/kernel.lock" | sed 's/^/  /'
+sed -n '2,$p' "$out/kernel.lock" | sed 's/^/  /'

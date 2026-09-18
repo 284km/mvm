@@ -45,6 +45,14 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 tools/abicheck.py --mere *.mere
 
+      # An option that is merely undocumented breaks no test: it works for
+      # everyone who already knows it exists. `mvm --help` was extracted by
+      # line number, so documenting one new option pushed `mvm status` and
+      # `mvm doctor` off the end of the help and nothing noticed.
+      - name: The usage names everything the tool accepts
+        if: ${{ !cancelled() }}
+        run: sh tools/checkopts.sh
+
       - name: Every script parses
         if: ${{ !cancelled() }}
         run: |
