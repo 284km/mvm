@@ -16,6 +16,23 @@ $ docker -H unix://.build/docker.sock version --format '{{.Server.Version}}/{{.S
 docker (macOS) -> a unix socket -> mvm -> virtio-vsock -> mengd -> mrun -> the container
 ```
 
+## What it needs
+
+- **macOS 15.0 or newer, on Apple silicon.** Not a preference: the interrupt
+  controller is `hv_gic_create` and the eight calls around it, and those are
+  `API_AVAILABLE(macos(15.0))`. Everything else it uses is macOS 11. On macOS 14
+  the loader refuses the binary before it can say anything of its own, so the
+  build declares the floor (`MACOSX_DEPLOYMENT_TARGET=15.0` in
+  `tools/mkbuild.sh`) and compiles the shim with
+  `-Werror=unguarded-availability-new`, which turns a call to anything newer
+  into a build failure here rather than a report from somebody else's Mac.
+- **A `docker` client**, pointed at the machine's socket. Any one will do; this
+  is checked against Docker's own.
+- **Nothing else to start a machine.** `mvm start` needs no docker daemon and no
+  container runtime on the host: the guest makes its own filesystem. `docker` on
+  the host is needed only by `mvm build --kernel`, which a release does not
+  make anyone run.
+
 `docker compose up` works, and so do published ports — a host TCP port carried
 in over vsock and delivered inside the container's own network namespace:
 

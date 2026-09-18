@@ -70,9 +70,15 @@ def main(argv):
         i = argv.index("--mere")
         meres = argv[i + 1:]
         argv = argv[:i]
-    if len(argv) < 3:
-        print("usage: abicheck.py <generated .c> <shim .c>... [--mere <file.mere>...]")
+    # THE DECLARATION CHECK NEEDS NO COMPILER. It reads .mere files as text, so
+    # it runs on any machine -- which is the whole point of having it: the file
+    # whose declarations rotted was one that nothing on this platform compiles.
+    if len(argv) < 3 and not meres:
+        print("usage: abicheck.py [<generated .c> <shim .c>...] [--mere <file.mere>...]",
+              file=sys.stderr)
         return 2
+    if len(argv) < 3:
+        return declarations_agree(meres)
     gen, shims = argv[1], argv[2:]
     src = open(gen, errors="replace").read()
     protos = {}

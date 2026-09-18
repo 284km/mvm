@@ -28,9 +28,21 @@ MERE="${MERE:-}"
 [ -n "$MERE" ] || { echo "mkbuild: set MERE=<a merelang/mere checkout>" >&2; exit 2; }
 M="$MERE/_build/default/bin/mere.exe"
 [ -x "$M" ] || { echo "mkbuild: no mere binary at $M" >&2; exit 2; }
-command -v docker >/dev/null 2>&1 || { echo "mkbuild: needs docker to build for the guest" >&2; exit 2; }
 IMG="${IMG:-gcc:14}"
 fail=0
+
+# THE OLDEST macOS THIS CAN RUN ON, written once. clang reads this variable for
+# every compile it does from here, so the floor does not have to be repeated at
+# each cc line -- and repeating a rule is how it becomes three different rules.
+#
+# 15.0 is not a preference. hv_gic_create and the eight calls around it are
+# API_AVAILABLE(macos(15.0)); everything else this uses is macOS 11. Without a
+# target declared, clang stamps the version of the machine that happened to do
+# the build (26.0 here) and, worse, says NOTHING when code calls something
+# newer -- and Hypervisor.framework has entries marked macos(26.0) and
+# macos(27.0) waiting to be called by accident.
+MVM_MACOS_MIN="${MVM_MACOS_MIN:-15.0}"
+export MACOSX_DEPLOYMENT_TARGET="$MVM_MACOS_MIN"
 
 emit() {  # emit <source> <out.c>
   "$M" -c "$1" > "$2" 2>"$out/mkbuild.err" || {
@@ -46,9 +58,13 @@ for prog in boot:mvm-boot mkdtb:mkdtb mports:mports mproxy:mproxy; do
     mports)     shim="$here/mports_shim.c"; extra="";;
     mproxy)     shim="$here/proxy_shim.c"; extra="";;
   esac
+  # -Werror on the availability warning, which is the whole reason the floor
+  # above is declared: calling something newer than 15.0 stops the build here
+  # rather than on somebody else's Mac.
   # shellcheck disable=SC2086
-  cc -O2 -o "$out/$bin" "$out/$src.c" "$shim" $extra 2>/dev/null \
-    || { echo "mkbuild: could not link $bin" >&2; fail=1; continue; }
+  cc -O2 -Werror=unguarded-availability-new -o "$out/$bin" "$out/$src.c" "$shim" $extra \
+       2>"$out/cc-$bin.err" \
+    || { echo "mkbuild: could not link $bin" >&2; sed -n 1,6p "$out/cc-$bin.err" >&2; fail=1; continue; }
   echo "  built $bin"
 done
 # SIGNED, and only the two that talk to the framework. An unsigned VMM is
@@ -60,6 +76,16 @@ for b in mvm-boot mkdtb; do
     || { echo "mkbuild: could not sign $b" >&2; fail=1; }
 done
 codesign -dv "$out/mvm-boot" 2>&1 | grep -q Signature && echo "  signed mvm-boot, mkdtb"
+
+# WHAT A MACHINE WITHOUT DOCKER CAN STILL CHECK. CI has no docker on macOS, and
+# the host's side is where the compiler is the gate; stopping here lets the real
+# build command run there rather than a copy of it kept in a workflow file.
+if [ "${MVM_HOST_ONLY:-0}" = 1 ]; then
+  echo "== stopping after the host's side (MVM_HOST_ONLY=1) =="
+  [ "$fail" = 0 ] || exit 1
+  exit 0
+fi
+command -v docker >/dev/null 2>&1 || { echo "mkbuild: needs docker to build for the guest" >&2; exit 2; }
 
 echo "== the guest's side =="
 [ -n "${MENGD_SRC:-}" ] && [ -f "$MENGD_SRC/mengd.mere" ] || { echo "mkbuild: set MENGD_SRC" >&2; exit 2; }

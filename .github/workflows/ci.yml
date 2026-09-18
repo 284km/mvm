@@ -1,0 +1,140 @@
+name: CI
+
+# WHAT CAN BE CHECKED WITHOUT A MACHINE, WHICH IS MORE THAN IT LOOKS.
+#
+# None of the fifteen gates in test/ can run here. They boot a real VM, and
+# GitHub's Apple silicon runners are themselves VMs on Apple's Virtualization
+# Framework, where nested virtualization is not available; the request to
+# enable Hypervisor.framework on them (actions/runner-images#13505) is closed as
+# not planned. A self-hosted runner is what GitHub itself advises against for a
+# public repository. So the machine-starting gates stay a thing run by hand,
+# and what is left is worth having on its own:
+#
+#   - EVERY .mere FILE COMPILES. Not every file is reachable from a gate:
+#     bench_guestmem.mere is imported by nothing and compiled by nothing, and
+#     that is exactly why it sat for months with two stale extern declarations,
+#     segfaulting with no output when anyone finally ran it.
+#   - EVERY DECLARATION OF ONE EXTERN AGREES. Needs no compiler at all -- it is
+#     text -- so it runs first and in seconds.
+#   - THE HOST'S BINARIES LINK, ARE SIGNED, AND DECLARE macOS 15.0. The
+#     deployment target is the only thing that makes clang object to a call
+#     that is newer than the oldest Mac this supports.
+#
+# The three jobs do not depend on each other. A red job must not turn the other
+# two into "skipped", which reads as "nothing else was wrong" and means
+# "nothing else was asked".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  declarations:
+    name: Declarations (no toolchain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # One shim function is declared separately in every Mere file that calls
+      # it, and those declarations age independently. hv_map went int -> str
+      # when a guest first asked for 2 GiB; two files were updated and one was
+      # not. This is that check, and it needs nothing installed.
+      - name: Every extern is declared the same way everywhere
+        if: ${{ !cancelled() }}
+        run: python3 tools/abicheck.py --mere *.mere
+
+      - name: Every script parses
+        if: ${{ !cancelled() }}
+        run: |
+          rc=0
+          for f in tools/mvm tools/*.sh test/*.sh; do
+            sh -n "$f" || { echo "::error file=$f::does not parse"; rc=1; }
+          done
+          exit $rc
+
+  compile:
+    name: Every .mere compiles (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The compiler is taken from its own repository at main rather than from
+      # a release: the newest tagged binary is hundreds of versions behind what
+      # this is written against, and compiling against a compiler nobody uses
+      # would be a check of the wrong thing.
+      - uses: actions/checkout@v5
+        with:
+          repository: merelang/mere
+          path: .mere-src
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.4"
+
+      - name: Build the compiler
+        working-directory: .mere-src
+        run: |
+          opam install . --deps-only
+          opam exec -- dune build
+
+      - name: Compile every .mere file
+        if: ${{ !cancelled() }}
+        run: |
+          M="$PWD/.mere-src/_build/default/bin/mere.exe"
+          [ -x "$M" ] || { echo "::error::no mere binary at $M"; exit 1; }
+          rc=0
+          n=0
+          for f in *.mere; do
+            n=$((n + 1))
+            if ! "$M" -c "$f" > /dev/null 2>/tmp/e; then
+              echo "::error file=$f::$(head -1 /tmp/e)"
+              sed -n 1,8p /tmp/e
+              rc=1
+            fi
+          done
+          # A loop that matched nothing exits 0 and says everything passed.
+          [ "$n" -gt 0 ] || { echo "::error::no .mere files were found"; exit 1; }
+          echo "compiled $n files"
+          exit $rc
+
+  host:
+    name: The host's binaries (macOS 15, arm64)
+    # The oldest macOS this supports, so the build happens on the floor it
+    # declares rather than above it.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: merelang/mere
+          path: .mere-src
+
+      - uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.4"
+
+      - name: Build the compiler
+        working-directory: .mere-src
+        run: |
+          opam install . --deps-only
+          opam exec -- dune build
+
+      # The real build command, not a copy of it kept here: MVM_HOST_ONLY stops
+      # it before the guest's side, which is the part that needs docker.
+      - name: Build, link and sign the host's side
+        if: ${{ !cancelled() }}
+        run: MERE="$PWD/.mere-src" MVM_HOST_ONLY=1 sh tools/mkbuild.sh
+
+      - name: It declares macOS 15.0, not whatever built it
+        if: ${{ !cancelled() }}
+        run: |
+          got=$(otool -l .build/mvm-boot | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+          echo "minos $got"
+          [ "$got" = "15.0" ] || { echo "::error::minos is $got, expected 15.0"; exit 1; }
+
+      - name: The declarations match the C that defines them
+        if: ${{ !cancelled() }}
+        run: python3 tools/abicheck.py .build/boot.c hv_shim.c --mere *.mere

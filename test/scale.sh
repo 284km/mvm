@@ -167,8 +167,25 @@ d=$(grep -a "dropped that inward stream\|gave up telling" "$V" 2>/dev/null | wc 
 [ "$d" = 0 ]; say $? "and the VMM dropped no inward stream ($d)"
 
 echo "== and the transport, at twice that =="
-# ONLY THE PROMISE IS ASSERTED HERE. The number that came up is printed,
-# because it is worth knowing and it is not a contract: see the comment on BIG.
+# AND NOW HOW MANY CAME UP, WHICH USED TO BE PRINTED AND NOT REQUIRED.
+#
+# It was not a contract because it was not understood: somewhere between 72 and
+# 79 of the eighty would appear, with every client reporting success, and four
+# measurements could not say why. Recording a number nobody could explain was
+# the honest thing to do at the time.
+#
+# It is a contract now because the cause has a name. mengd takes one of 32
+# buffer slots per CONNECTION, and /wait answers its headers and then polls
+# until the container exits -- while the docker CLI sends /start only AFTER
+# those headers arrive. Measured through a recording relay at eighty parallel:
+# 80 /wait opened and 32 got slots, those 32 clients sent /start, all 32 /start
+# queued for a slot that a waiting /wait was holding, and nothing finished --
+# 80 creates answered, not one container started. c_wait now gives its slot
+# back before it polls, and the same measurement is 80 of 80.
+#
+# To poison it: make st_slot_drop in mengd's store_shim.c a no-op
+#   sed 's/int st_slot_drop(void) { return st_slot_release(-1); }/int st_slot_drop(void) { return 0; }/'
+# rebuild the guest (tools/mkbuild.sh) and run this again. It goes to 0 of 80.
 for n in $(docker ps -aq 2>/dev/null); do docker rm -f "$n" >/dev/null 2>&1; done
 sleep 2
 rm -rf "$out/scale-big"; mkdir -p "$out/scale-big"
@@ -185,7 +202,8 @@ for e in "$out/scale-big"/e.*; do [ -s "$e" ] && bad=$((bad + 1)); done
 [ "$(refused)" = 0 ]; say $? "the VMM refused nothing at $BIG ($(streams))"
 d=$(grep -a "dropped that inward stream\|gave up telling" "$V" 2>/dev/null | wc -l | tr -d ' ')
 [ "$d" = 0 ]; say $? "and lost no inward stream at $BIG ($d)"
-echo "  note  $big of $BIG came up -- reported, not required: one vCPU and 32 request slots"
+[ "$big" = "$BIG" ]
+say $? "and all $BIG of them came up ($big), on one vCPU with 32 request slots"
 
 echo "== removing them takes their processes =="
 for n in $(docker ps -aq 2>/dev/null); do docker rm -f "$n" >/dev/null 2>&1; done

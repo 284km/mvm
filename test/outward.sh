@@ -112,5 +112,29 @@ echo "== what the proxy will not do =="
 o=$(docker run --rm alpine:latest sh -c "wget -q -T 10 -O- 'https://example.com/' 2>&1" | tr -d '\r' | head -c 80)
 echo "  note  busybox wget cannot CONNECT, so https from it fails by design: ${o:-<nothing>}"
 
+echo "== and the same machine started with --proxy-everywhere =="
+# WHAT THE DEFAULT COSTS, AND THE WAY OUT OF IT.
+#
+# A network somebody created is given no proxy, which is the right default for
+# a network whose members were named on purpose -- but `docker compose` creates
+# one for every project, so by default a compose service cannot reach anything
+# outside. Measured on the default above: zero proxy variables and plain http
+# fails. The daemon has always had the switch; nothing on the host could ask
+# for it.
+#
+# The same machine, restarted: the default is not being changed, an option is
+# being added, so this checks BOTH -- the lines above are the other half.
+sh "$here/tools/mvm" stop --name "$M" >/dev/null 2>&1
+sh "$here/tools/mvm" start --name "$M" --proxy-everywhere > "$out/outward-pe.log" 2>&1
+say $? "mvm start --proxy-everywhere"
+p2=$(sed -n 's/.*proxy on \([0-9][0-9]*\).*/\1/p' "$out/outward-pe.log" | head -1)
+docker network create appnet2 >/dev/null 2>&1
+n=$(docker run --rm --network appnet2 alpine:latest sh -c 'echo "[$http_proxy]"' 2>/dev/null | tr -d '\r')
+[ "$n" != "[]" ]; say $? "now a container on a created network IS told where the proxy is ($n)"
+o=$(docker run --rm --network appnet2 alpine:latest wget -q -T 10 -O- http://example.com/ 2>&1 | head -c 12)
+[ -n "$o" ]; say $? "and plain http from it reaches the world"
+o=$(docker run --rm --network none alpine:latest sh -c 'echo "[$http_proxy]"' 2>/dev/null | tr -d '\r')
+[ "$o" = "[]" ]; say $? "--network none still has nowhere to send anything ($o)"
+
 [ "$fail" = 0 ] && echo "outward PASS" || echo "outward FAIL"
 exit "$fail"

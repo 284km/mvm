@@ -10,6 +10,7 @@
 #   mvm package
 #   mvm start [--name N] [--disk-size MiB] [--ram MB] [--cpus N]
 #             [-p HOST:GUEST]... [--proxy-port P | --no-proxy]
+#             [--proxy-everywhere]
 #   mvm stop  [--name N]
 #   mvm status [--name N]
 #   mvm doctor
@@ -73,6 +74,16 @@ while [ $# -gt 0 ]; do
     --cpus) CPUS="$2"; shift 2;;
     -p|--publish) PORTS="$PORTS $2"; shift 2;;
     --proxy-port) PROXY_PORT="$2"; PROXY_PINNED=1; shift 2;;
+    # WHO IS TOLD WHERE THE WAY OUT IS.
+    #
+    # By default only containers on the default bridge, because a network
+    # somebody created is one they said what belongs on. But `docker compose`
+    # creates a network for every project, so by default no compose service can
+    # reach anything outside -- measured: a container on a created network gets
+    # zero proxy variables and plain http fails. This hands the same address to
+    # every container instead. The daemon has always been able to do it; there
+    # was no way to ask for it from here.
+    --proxy-everywhere) PROXY_EVERYWHERE=1; shift;;
     --no-proxy) USE_PROXY=0; shift;;
     --kernel) KERNEL_ONLY=1; shift;;
     --version) KVER="$2"; shift 2;;
@@ -263,6 +274,7 @@ start() {
       # which in a container is its own loopback. MENGD_PROXY is the daemon's
       # own copy, in the machine's namespace, where 127.0.0.1 is right.
       bootproxy=" MVM_FWD_OUT=$PROXY_PORT:$PROXY_PORT MENGD_PROXY=127.0.0.1:$PROXY_PORT"
+      [ "${PROXY_EVERYWHERE:-0}" = 1 ] && bootproxy="$bootproxy MENGD_CONTAINER_PROXY=all"
     fi
   fi
   # No deadline: a machine somebody started is not on a timer.

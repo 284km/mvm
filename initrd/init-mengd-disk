@@ -141,6 +141,10 @@ fi
 # route out of here at all, so a registry that redirects to a content network
 # is unreachable without one.
 [ -n "${MENGD_PROXY:-}" ] && export MENGD_PROXY
+# And who is told about it: by default the default bridge only, `all` for every
+# container. `docker compose` puts its services on a network it creates, so
+# without this a compose project has no way out at all.
+[ -n "${MENGD_CONTAINER_PROXY:-}" ] && export MENGD_CONTAINER_PROXY
 
 MENGD_TRACE=1 /opt/mengd vsock://1024 /var/lib/mengd /usr/local/bin/mrun \
     >> /var/log/mengd.log 2>&1
