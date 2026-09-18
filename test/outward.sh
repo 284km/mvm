@@ -90,6 +90,35 @@ else
   [ "$o" = 200 ]; say $? "and https by CONNECT ($o)"
 fi
 
+echo "== and the same port answers SOCKS5, for what does not speak HTTP =="
+# WHY THERE IS A SECOND PROTOCOL. The four *_PROXY names reach only clients
+# that speak HTTP to a proxy. The guest has no resolver and no route, so
+# everything else -- git over ssh, a database client, anything reading
+# ALL_PROXY -- could not get out at all. A route would want NAT, and this
+# guest's kernel has neither nf_nat nor a tun device (measured: /proc has the
+# netfilter core and nothing that does address translation). SOCKS5 needs none
+# of that: it is the same two sockets, and the first byte says which protocol
+# is being spoken.
+a=$(docker run --rm alpine:latest sh -c 'echo $ALL_PROXY' 2>/dev/null | tr -d '\r')
+[ "$a" = "socks5h://$gw:$port" ]; say $? "a container is told the same address as SOCKS ($a)"
+# socks5h, not socks5: the h is "the proxy resolves the name". Without it the
+# client resolves first, and this guest cannot.
+case "$a" in socks5h://*) true;; *) false;; esac
+say $? "and with the h, so the name is resolved by the end that can"
+# THREE ANSWERS, ASKED AS BYTES. A proxy that accepted everything and a proxy
+# that worked would both pass a check that only fetched a page.
+r=$(python3 "$here/test/socks_probe.py" 127.0.0.1 "$port" 1 example.com 443 2>/dev/null)
+[ "$r" = "0 0" ]; say $? "CONNECT through it succeeds (method/reply: $r)"
+r=$(python3 "$here/test/socks_probe.py" 127.0.0.1 "$port" 2 example.com 443 2>/dev/null)
+[ "$r" = "0 7" ]; say $? "a command it does not implement is refused BY CODE, not by hanging ($r)"
+r=$(python3 "$here/test/socks_probe.py" 127.0.0.1 "$port" 1 no-such-host.invalid 443 2>/dev/null)
+[ "$r" = "0 4" ]; say $? "and a name that does not exist says so ($r)"
+if [ "$apk" = 0 ]; then
+  o=$(docker run --rm alpine:latest sh -c 'apk add --no-cache curl >/dev/null 2>&1;
+      curl -s -o /dev/null -w "%{http_code}" --max-time 25 --socks5-hostname '"$gw"':'"$port"' https://example.com/' 2>/dev/null | tr -d '\r')
+  [ "$o" = 200 ]; say $? "and a container reaches the world through SOCKS ($o)"
+fi
+
 echo "== on a network somebody created =="
 docker network create appnet >/dev/null 2>&1; say $? "a network"
 docker run -d --name peer --network appnet alpine:latest \

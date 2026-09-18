@@ -58,6 +58,67 @@ const char *px_line(int fd) {
     return PX_LINE;
 }
 
+/* THE FIRST BYTE, WITHOUT TAKING IT. A SOCKS5 greeting is three bytes and no
+ * newline, so px_line would sit there until the ten-second poll gave up and
+ * then hand back "" -- the protocol has to be decided before anything is
+ * consumed. -1 means nothing arrived, which is what a port check looks like. */
+int px_peek1(int fd) {
+    struct pollfd pf; pf.fd = fd; pf.events = POLLIN; pf.revents = 0;
+    if (poll(&pf, 1, 10000) <= 0) return -1;
+    unsigned char c;
+    ssize_t n = recv(fd, &c, 1, MSG_PEEK);
+    return n == 1 ? (int)c : -1;
+}
+
+/* EXACTLY n BYTES, AS HEX. Binary crosses this boundary as a hex string for
+ * the same reason it does everywhere else here: a Mere str is not a byte
+ * buffer, and a length that has to survive a NUL is a length that has to be
+ * written down. "" means the peer stopped or did not send enough. */
+static _Thread_local char PX_HEX[1025];
+const char *px_read_hex(int fd, int n) {
+    static const char d[] = "0123456789abcdef";
+    if (n < 0 || n > 512) { PX_HEX[0] = 0; return PX_HEX; }
+    unsigned char buf[512];
+    int got = 0;
+    while (got < n) {
+        struct pollfd pf; pf.fd = fd; pf.events = POLLIN; pf.revents = 0;
+        if (poll(&pf, 1, 10000) <= 0) { PX_HEX[0] = 0; return PX_HEX; }
+        ssize_t r = read(fd, buf + got, (size_t)(n - got));
+        if (r <= 0) { PX_HEX[0] = 0; return PX_HEX; }
+        got += (int)r;
+    }
+    for (int i = 0; i < n; i++) {
+        PX_HEX[i * 2] = d[buf[i] >> 4];
+        PX_HEX[i * 2 + 1] = d[buf[i] & 15];
+    }
+    PX_HEX[n * 2] = 0;
+    return PX_HEX;
+}
+
+/* And the other direction. An odd number of digits is a caller's mistake and
+ * is refused rather than rounded. */
+int px_write_hex(int fd, const char *hex) {
+    size_t len = strlen(hex);
+    if (len % 2) return -1;
+    unsigned char buf[512];
+    size_t n = len / 2;
+    if (n > sizeof buf) return -1;
+    for (size_t i = 0; i < n; i++) {
+        int hi = hex[i * 2], lo = hex[i * 2 + 1];
+        hi = hi >= 'a' ? hi - 'a' + 10 : (hi >= 'A' ? hi - 'A' + 10 : hi - '0');
+        lo = lo >= 'a' ? lo - 'a' + 10 : (lo >= 'A' ? lo - 'A' + 10 : lo - '0');
+        if (hi < 0 || hi > 15 || lo < 0 || lo > 15) return -1;
+        buf[i] = (unsigned char)((hi << 4) | lo);
+    }
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, buf + off, n - off);
+        if (w <= 0) return -1;
+        off += (size_t)w;
+    }
+    return (int)off;
+}
+
 int px_write(int fd, const char *s) {
     size_t len = strlen(s), off = 0;
     while (off < len) {

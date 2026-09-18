@@ -13,6 +13,18 @@
 // through this. Everything after the first line is ciphertext here, which is
 // the whole difference between this and terminating TLS on the host's side.
 //
+// AND SOCKS5, ON THE SAME PORT. A CONNECT proxy carries what speaks HTTP to a
+// proxy, which is most of what a container does -- and nothing else. The guest
+// has no resolver and no route, so a client that is not an HTTP client cannot
+// get out at all. SOCKS5 (RFC 1928) is the other thing such clients already
+// speak: git, ssh through ProxyCommand, curl, and the many libraries that read
+// ALL_PROXY. It is the same two sockets and the same copy loop; only the
+// handshake differs, and the first byte says which one is being spoken.
+//
+// What it still does not carry: anything that speaks neither -- nc, ping,
+// psql. Those want a route, and a route wants NAT in the guest's kernel, which
+// has neither nf_nat nor a tun device. That is measured, not assumed.
+//
 //   mproxy <port>
 //
 // It binds the loopback. What is on the other end of this is a virtual machine
@@ -26,6 +38,33 @@ extern fn px_line: int -> str;
 extern fn px_write: int -> str -> int;
 extern fn px_connect: str -> int -> int;
 extern fn px_pipe: int -> int -> int;
+extern fn px_peek1: int -> int;
+extern fn px_read_hex: int -> int -> str;
+extern fn px_write_hex: int -> str -> int;
+
+// ---- the small amount of binary SOCKS5 needs ------------------------------
+
+let hdig = fn (ch: int) ->
+  if ch >= 48 && ch <= 57 then ch - 48
+  else if ch >= 97 && ch <= 102 then ch - 87
+  else if ch >= 65 && ch <= 70 then ch - 55
+  else 0;
+
+// Byte i of a hex string, as a number.
+let hbyte = fn (h: str) -> fn (i: int) ->
+  hdig (ord (char_at h (i * 2))) * 16 + hdig (ord (char_at h (i * 2 + 1)));
+
+let hx2 = fn (v: int) ->
+  let d = "0123456789abcdef" in
+  char_at d (bit_and (bit_shr v 4) 15) ++ char_at d (bit_and v 15);
+
+// The n bytes of a hex string, as the text they spell. A SOCKS5 client that
+// sends a NAME rather than an address is the case that matters here: the guest
+// cannot resolve, so a client which resolves first has already failed.
+let hex_text = fn (h: str) -> fn (n: int) ->
+  let rec go = fn (i: int) -> fn (acc: str) ->
+    if i == n then acc else go (i + 1) (acc ++ chr (hbyte h i)) in
+  go 0 "";
 
 // The last occurrence, for splitting "host:port" -- an IPv6 literal has
 // colons of its own, and the port is after the last one.
@@ -133,12 +172,93 @@ let forward_headers = fn (c: int) -> fn (up: int) ->
   let _ = px_write up "Connection: close\r\n\r\n" in
   ();
 
+// ---- SOCKS5 (RFC 1928) ---------------------------------------------------
+//
+// A reply is ten bytes: version, the answer, a reserved zero, then an address
+// and port that the client is not required to care about and this does not
+// pretend to know -- 0.0.0.0:0 is what a proxy that did not bind anything of
+// its own has to say.
+let socks_reply = fn (c: int) -> fn (code: int) ->
+  px_write_hex c ("05" ++ hx2 code ++ "0001" ++ "00000000" ++ "0000");
+
+let socks_no = fn (c: int) -> fn (code: int) -> fn (why: str) ->
+  let _ = if tracing () then print_err ("mproxy: socks refused -- " ++ why) else () in
+  let _ = socks_reply c code in
+  let _ = px_close c in ();
+
+let serve_socks = fn (c: int) ->
+  // The greeting: version, how many methods, then that many.
+  let g = px_read_hex c 2 in
+  if str_len g < 4 then (let _ = px_close c in ())
+  else
+    let nmeth = hbyte g 1 in
+    let _ = if nmeth > 0 then (let _ = px_read_hex c nmeth in ()) else () in
+    // No authentication. This listens on the loopback and the only thing on
+    // the other side is the machine this host started; a password here would
+    // be a secret shared with oneself.
+    let _ = px_write_hex c "0500" in
+    let r = px_read_hex c 4 in
+    if str_len r < 8 then (let _ = px_close c in ())
+    else
+      let cmd = hbyte r 1 in
+      let atyp = hbyte r 3 in
+      if cmd != 1 then socks_no c 7 ("command " ++ show cmd ++ " -- only CONNECT")
+      else
+        let host =
+          if atyp == 1 then
+            let a = px_read_hex c 4 in
+            if str_len a < 8 then ""
+            else show (hbyte a 0) ++ "." ++ show (hbyte a 1) ++ "."
+              ++ show (hbyte a 2) ++ "." ++ show (hbyte a 3)
+          else if atyp == 3 then
+            let l = px_read_hex c 1 in
+            if str_len l < 2 then ""
+            else
+              let n = hbyte l 0 in
+              let d = px_read_hex c n in
+              if str_len d < n * 2 then "" else hex_text d n
+          else "" in
+        if atyp != 1 && atyp != 3 then
+          // Named, not ignored. 0x08 is "address type not supported", and a
+          // client that sent an IPv6 literal deserves to be told that rather
+          // than left to time out.
+          socks_no c 8 ("address type " ++ show atyp)
+        else if str_len host == 0 then socks_no c 1 "the address did not arrive"
+        else
+          let pb = px_read_hex c 2 in
+          if str_len pb < 4 then (let _ = px_close c in ())
+          else
+            let port = hbyte pb 0 * 256 + hbyte pb 1 in
+            let up = px_connect host port in
+            if up < 0 then
+              // The same two facts CONNECT distinguishes, in the codes SOCKS5
+              // has for them: 4 is "host unreachable", 5 is "refused".
+              let _ = print_err ("mproxy: socks cannot reach " ++ host ++ ":" ++ show port
+                              ++ (if up == 0 - 2 then " (no such host)" else " (nothing listening)")) in
+              let _ = socks_reply c (if up == 0 - 2 then 4 else 5) in
+              let _ = px_close c in ()
+            else
+              let _ = if tracing () then
+                        print_err ("mproxy: socks " ++ host ++ ":" ++ show port) else () in
+              let _ = socks_reply c 0 in
+              let _ = px_pipe c up in
+              ();
+
 let serve_one = fn (c: int) ->
+  // WHICH PROTOCOL, FROM ONE BYTE, WITHOUT TAKING IT. SOCKS5 opens with 0x05
+  // and no newline; reading a line first would wait ten seconds for a newline
+  // that is not coming and then answer 405 to a client that spoke correctly.
+  let first = px_peek1 c in
+  if first == 5 then serve_socks c
+  else if first < 0 then
+    // Nothing was said. A port check opens and closes without a word, and
+    // `mvm start` does exactly this to find out whether the proxy is up.
+    (let _ = px_close c in ())
+  else
   let line = px_line c in
   if str_len line == 0 then
-    // Nothing was said. A port check opens and closes without a word, and
-    // answering it 405 puts a refusal in the log for something that never
-    // asked. `mvm start` does exactly this to find out whether the proxy is up.
+    // A byte arrived and no line followed it: the peer said something this
+    // does not understand and then stopped. Nothing to answer.
     (let _ = px_close c in ())
   else
   let (h, p) = parse_connect line in

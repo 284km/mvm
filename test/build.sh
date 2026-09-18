@@ -176,17 +176,57 @@ rm -rf "$X"
 env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
     sh "$R/tools/mvm" doctor >/dev/null 2>&1
 say $? "and none of it depends on this shell's environment (env -i)"
+
+# NOR ON ANYTHING IN THIS MACHINE'S HOME. The archive used to be started with
+# HOME set to this one, which has ~/.docker, ~/.mvm and whatever else years of
+# use put there. Somebody else's Mac has none of it, and a release that quietly
+# needs one of those files works here and nowhere else.
+FH="$out/rel-home"; rm -rf "$FH"; mkdir -p "$FH"
+[ "$(ls -A "$FH" | wc -l | tr -d ' ')" = 0 ]
+say $? "a home directory with nothing in it"
+
+# AND NOTHING IN IT NAMES THIS MACHINE. A path baked into a binary or the tool
+# is the other way a release runs here and nowhere else, and it survives every
+# check that only asks whether things work.
+loc=0; read_=0
+for f in "$R/tools/mvm" "$R/INSTALL" "$R/kernel.lock"; do
+  n=$(grep -ac '/Users/\|/opt/homebrew' "$f" 2>/dev/null); loc=$((loc + ${n:-0}))
+  n=$(wc -l < "$f" 2>/dev/null); read_=$((read_ + ${n:-0}))
+done
+for b in mvm-boot mkdtb mports mproxy Image initrd-format.gz; do
+  n=$(strings "$R/$b" 2>/dev/null | grep -ac '/Users/\|/opt/homebrew'); loc=$((loc + ${n:-0}))
+  n=$(strings "$R/$b" 2>/dev/null | wc -l); read_=$((read_ + ${n:-0}))
+done
+[ "$read_" -gt 1000 ]; say $? "the archive can be read at all ($read_ lines of text and strings)"
+[ "$loc" = 0 ]; say $? "and nothing in it names a path on this machine ($loc)"
+
+# THE BRANCH THAT FIRES ON EVERY DOWNLOAD. macOS marks what a browser fetched,
+# and a marked VMM does not refuse -- it hangs. doctor has said so since the
+# day that cost an afternoon, and nothing had ever made it say it. The mark
+# goes on a COPY and the copy is never run: executing a quarantined binary is
+# what raises the dialog, and the point is that doctor answers without doing
+# that.
+Q="$out/rel-quarantined"; rm -rf "$Q"; cp -R "$R" "$Q"
+xattr -w com.apple.quarantine "0081;00000000;Safari;" "$Q/mvm-boot" 2>/dev/null
+xattr -p com.apple.quarantine "$Q/mvm-boot" >/dev/null 2>&1
+say $? "a downloaded copy carries the quarantine mark"
+env PATH=/usr/bin:/bin:/usr/sbin:/sbin sh "$Q/tools/mvm" doctor > "$out/build-q.log" 2>&1
+[ "$?" != 0 ] && grep -q "quarantine" "$out/build-q.log"
+say $? "and doctor refuses it by name ($(grep -o 'it is quarantined[^;]*' "$out/build-q.log" | head -1))"
+xattr -dr com.apple.quarantine "$Q" 2>/dev/null; rm -rf "$Q"
+
 RM="rel$$"
-env PATH=/usr/bin:/bin:/usr/sbin:/sbin MVM_HOME="$MVM_HOME" \
+env -i HOME="$FH" PATH=/usr/bin:/bin:/usr/sbin:/sbin TMPDIR=/tmp \
     sh "$R/tools/mvm" start --name "$RM" --disk-size 1024 > "$out/build-rel.log" 2>&1
-say $? "and a machine starts from it, with docker off the PATH"
-o=$(DOCKER_HOST="unix://$MVM_HOME/$RM/docker.sock" DOCKER_CONTEXT= sh -c '
+say $? "and a machine starts from it: empty environment, empty home, docker off the PATH"
+o=$(DOCKER_HOST="unix://$FH/.mvm/$RM/docker.sock" DOCKER_CONTEXT= sh -c '
   DOCKER_HOST= docker save alpine:latest -o '"$out"'/build-rel.tar 2>/dev/null
   docker load -i '"$out"'/build-rel.tar >/dev/null 2>&1
   docker run --rm alpine:latest echo from-a-tarball 2>/dev/null' | tr -d '\r\n')
 [ "$o" = "from-a-tarball" ]; say $? "and runs a container ($o)"
-sh "$R/tools/mvm" stop --name "$RM" >/dev/null 2>&1
-rm -rf "$MVM_HOME/$RM" "$T"; docker context rm "mvm-$RM" >/dev/null 2>&1
+env -i HOME="$FH" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+    sh "$R/tools/mvm" stop --name "$RM" >/dev/null 2>&1
+rm -rf "$FH" "$T"; docker context rm "mvm-$RM" >/dev/null 2>&1
 
 echo "== starting it again costs nothing =="
 # The initramfs is built from a pipe, so gzip stores no timestamp and the same

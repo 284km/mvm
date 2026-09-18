@@ -402,6 +402,38 @@ asking this to fetch on its behalf, which is a different thing — and for
 skips** without it. Its oracle is not this stack: the config digest of the
 arm64 manifest out of what `docker` downloaded for the same reference.
 
+### And SOCKS5, on the same port
+
+`CONNECT` carries what speaks HTTP to a proxy, and nothing else. A container
+that wants `git` over ssh, or a database somewhere, or anything that is not an
+HTTP client, could not get out at all: the guest has no resolver and no route.
+
+A route would want NAT, and this guest's kernel does not have it — `/proc` has
+the netfilter core and neither `ip_tables` nor `nf_nat`, and there is no `tun`
+device. That is measured, not assumed, and adding them would mean shipping six
+more version-pinned modules beside the Image.
+
+SOCKS5 needs none of it. It is the same two sockets and the same copy loop;
+only the handshake differs, and **the first byte says which protocol is being
+spoken**, so it answers both on one port. Containers are told
+`ALL_PROXY=socks5h://<gateway>:<port>` beside the four `*_PROXY` names — with
+the `h`, because that is the form where the *proxy* resolves the name, and this
+guest is the end that cannot.
+
+```
+$ docker run --rm alpine sh -c 'printf "QUIT\r\n" | curl -sS telnet://smtp.gmail.com:25'
+220 smtp.gmail.com ESMTP ...
+```
+
+That is a container, with no network interface underneath it, holding a plain
+TCP conversation with something that has never heard of HTTP.
+
+**What it still does not carry**: anything that speaks neither protocol — `nc`,
+`ping`, `psql`. Those want a route. `test/outward.sh` asks the proxy in bytes
+rather than pages: a command it does not implement comes back `0x07` and a name
+that does not exist comes back `0x04`, because a proxy that accepted everything
+and a proxy that worked would both pass a check that only fetched a page.
+
 ## Three programs and one number
 
 A published port needs all three, and each knows something the others cannot:
