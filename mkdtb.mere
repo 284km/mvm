@@ -15,7 +15,6 @@ import "fdt.mere";
 extern fn hv_up: unit -> int;
 extern fn hv_gic_dist_size: unit -> int;
 extern fn hv_gic_redist_size: unit -> int;
-extern fn hv_gic_redist_region_size: unit -> int;
 extern fn hv_now_secs: unit -> int;
 
 let ram_base    = 0x40000000;

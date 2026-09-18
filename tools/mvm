@@ -26,6 +26,10 @@ out="$here/.build"
 # right there. The same tool runs from both, and the difference is one line
 # rather than a second script that would have to be kept in step.
 [ -r "$here/Image" ] && out="$here"
+# WHICH VMM TO RUN. One name, so a gate can start a machine with a variant it
+# built -- test/bigdisk.sh runs a deliberately broken one -- without swapping
+# the real binary in place, where an interrupted run would leave it.
+VMM="${MVM_BOOT:-$out/mvm-boot}"
 MVM_HOME="${MVM_HOME:-$HOME/.mvm}"
 NAME=default
 DISK_MB=20480
@@ -106,7 +110,7 @@ doctor() {
   chk() { if [ -r "$2" ] || [ -x "$2" ]; then echo "  ok    $1"; else echo "  MISSING $1 -- $3"; rc=1; fi; }
   echo "== what a machine is made of =="
   chk "an arm64 kernel Image"      "$out/Image"     "gunzip -c /boot/vmlinuz-\$(uname -r) > .build/Image, on a Linux box with that kernel"
-  chk "the VMM"                    "$out/mvm-boot"  "sh test/stack.sh builds it, or build boot.mere yourself"
+  chk "the VMM"                    "$VMM"           "sh test/stack.sh builds it, or build boot.mere yourself"
   chk "the device tree writer"     "$out/mkdtb"     "same"
   chk "the port watcher"           "$out/mports"    "same"
   chk "the way out (a CONNECT proxy)" "$out/mproxy" "same -- without it nothing inside can reach the network"
@@ -140,14 +144,14 @@ doctor() {
   # makes macOS refuse to run it, and the refusal names Gatekeeper rather than
   # this tool. Nothing here can remove it for the user -- that is the point of
   # it -- so it is named.
-  if xattr -p com.apple.quarantine "$out/mvm-boot" >/dev/null 2>&1; then
-    echo "  MISSING permission to run the VMM -- it is quarantined; xattr -d com.apple.quarantine $out/mvm-boot"
+  if xattr -p com.apple.quarantine "$VMM" >/dev/null 2>&1; then
+    echo "  MISSING permission to run the VMM -- it is quarantined; xattr -d com.apple.quarantine $VMM"
     rc=1
   fi
   orphans
-  codesign -dv "$out/mvm-boot" 2>&1 | grep -q "Signature" \
+  codesign -dv "$VMM" 2>&1 | grep -q "Signature" \
     && echo "  ok    the VMM is signed (Hypervisor.framework refuses an unsigned one)" \
-    || { echo "  MISSING a signature on $out/mvm-boot -- codesign --sign - --force --entitlements mvm.entitlements"; rc=1; }
+    || { echo "  MISSING a signature on $VMM -- codesign --sign - --force --entitlements mvm.entitlements"; rc=1; }
   return $rc
 }
 
@@ -197,7 +201,7 @@ ensure_disk() {
   # One CPU to make a filesystem: the formatter runs mke2fs and copies files,
   # and nothing about that is faster on four.
   MVM_RAM_MB="$RAM_MB" MVM_VCPUS=1 MVM_TIMEOUT_MS=300000 \
-    "$out/mvm-boot" "$out/Image" "$D/format.dtb" "$ird" "$D/disk.img" \
+    "$VMM" "$out/Image" "$D/format.dtb" "$ird" "$D/disk.img" \
     > "$D/format.log" 2>&1
   if ! grep -qa "format: done" "$D/format.log"; then
     echo "mvm: the guest could not prepare its disk:" >&2
@@ -278,7 +282,7 @@ start() {
   MVM_CONTROL="$CTL" \
   MVM_RAM_MB="$RAM_MB" \
   MVM_VCPUS="$CPUS" \
-      "$out/mvm-boot" "$out/Image" "$D/machine.dtb" "" "$D/disk.img" \
+      "$VMM" "$out/Image" "$D/machine.dtb" "" "$D/disk.img" \
       > "$D/console.log" 2> "$D/vmm.log" &
   echo $! > "$D/vmm.pid"
   i=0
@@ -292,10 +296,23 @@ start() {
   echo $! > "$D/mports.pid"
   # The client's end. A context rather than an exported variable, so it
   # survives a new terminal.
-  docker context rm "mvm-$NAME" >/dev/null 2>&1
-  docker context create "mvm-$NAME" --docker "host=unix://$SOCK" >/dev/null 2>&1 \
-    && echo "mvm: $NAME is up -- docker context use mvm-$NAME" \
-    || echo "mvm: $NAME is up -- export DOCKER_HOST=unix://$SOCK"
+  #
+  # AN EXISTING ONE THAT ALREADY POINTS HERE IS LEFT ALONE. The socket path is
+  # derived from the machine's name, so the context a previous start made is
+  # still correct -- and `docker context rm` REFUSES the context the user is
+  # currently using, which made `mvm stop && mvm start` print the DOCKER_HOST
+  # fallback as though the context could not be made, while the context sitting
+  # there worked perfectly well.
+  want="unix://$SOCK"
+  have="$(docker context inspect "mvm-$NAME" --format '{{.Endpoints.docker.Host}}' 2>/dev/null)"
+  if [ "$have" = "$want" ]; then
+    echo "mvm: $NAME is up -- docker context use mvm-$NAME"
+  else
+    [ -n "$have" ] && docker context rm "mvm-$NAME" >/dev/null 2>&1
+    docker context create "mvm-$NAME" --docker "host=$want" >/dev/null 2>&1 \
+      && echo "mvm: $NAME is up -- docker context use mvm-$NAME" \
+      || echo "mvm: $NAME is up -- export DOCKER_HOST=$want"
+  fi
   grep -a "userspace: \(overlay mounts\|bridge and veth\)" "$D/console.log" | sed 's/^.*userspace: /  guest: /'
 }
 
@@ -342,7 +359,7 @@ stop() {
 # removed is a decision for the person who removed it.
 orphans() {
   found=""
-  for p in $(pgrep -f "$out/mvm-boot" 2>/dev/null); do
+  for p in $(pgrep -f "$VMM" 2>/dev/null); do
     owned=no
     for d in "$MVM_HOME"/*/; do
       [ -r "$d/vmm.pid" ] && [ "$(cat "$d/vmm.pid" 2>/dev/null)" = "$p" ] && owned=yes

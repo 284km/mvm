@@ -92,5 +92,44 @@ busy=$(lat)
 say $? "and is not slowed to a crawl by them ($idle ms -> $busy ms, one vCPU was ${idle} -> about 5x)"
 for n in $(docker ps -aq --filter name=wk 2>/dev/null); do docker rm -f "$n" >/dev/null 2>&1; done
 
+# A TRAPPED REGISTER IS NAMED ONCE, NOT ONCE PER CPU.
+#
+# Each CPU runs the same bring-up, so each one trapped the same two debug
+# registers, and the VMM said so every time. Four lines became eight; sixty-
+# four vCPUs would have made a hundred and twenty-eight, and a register
+# trapped inside a LOOP would have had no bound at all -- one stuck vsock
+# table once wrote 177,680 lines and 12.9 MB this way.
+#
+# The invariant does not name a count: however many distinct registers the
+# kernel asks about, the log holds each of them exactly once.
+echo "== a register this VMM does not model is named once =="
+tot=$(grep -c "does not model" "$D/vmm.log" 2>/dev/null | tr -d ' ')
+dis=$(grep "does not model" "$D/vmm.log" 2>/dev/null | grep -o "s[0-9]_[0-9]_c[0-9]*_c[0-9]*_[0-9]*" | sort -u | wc -l | tr -d ' ')
+[ "${tot:-0}" -gt 0 ] && [ "$tot" = "$dis" ]
+say $? "$tot lines for $dis distinct registers, across all four CPUs"
+
+echo "== poison: let it say so every time =="
+# Built here rather than trusted from .build: this gate is run on its own as
+# often as it is run from all.sh, and a stale boot.c would poison the poison.
+MEREX="${MERE:-}/_build/default/bin/mere.exe"
+[ -x "$MEREX" ] && "$MEREX" -c "$here/boot.mere" > "$out/vc-boot.c" 2>/dev/null
+say $? "boot.mere compiles (MERE must be set for the poison)"
+sed 's/if (SYS_SEEN\[i\] == key) { pthread_mutex_unlock(&SYS_M); return 0; }/if (SYS_SEEN[i] == key) { pthread_mutex_unlock(\&SYS_M); return 1; }/' \
+  "$here/hv_shim.c" > "$out/vc-poison.c"
+cmp -s "$here/hv_shim.c" "$out/vc-poison.c" && { echo "  FAIL  the poison changed nothing"; fail=1; }
+cc -O2 -o "$out/mvm-boot-vcpoison" "$out/vc-boot.c" "$out/vc-poison.c" -framework Hypervisor 2>/dev/null \
+  && codesign --sign - --force --entitlements "$here/mvm.entitlements" "$out/mvm-boot-vcpoison" 2>/dev/null
+say $? "it builds"
+P="${M}p"
+sh "$here/tools/mvm" stop --name "$P" >/dev/null 2>&1; rm -rf "$MVM_HOME/$P"
+MVM_BOOT="$out/mvm-boot-vcpoison" MVM_VCPUS=4 sh "$here/tools/mvm" start --name "$P" \
+  --disk-size 2048 > "$out/vc-poison.log" 2>&1
+pt=$(grep -c "does not model" "$MVM_HOME/$P/vmm.log" 2>/dev/null | tr -d ' ')
+pd=$(grep "does not model" "$MVM_HOME/$P/vmm.log" 2>/dev/null | grep -o "s[0-9]_[0-9]_c[0-9]*_c[0-9]*_[0-9]*" | sort -u | wc -l | tr -d ' ')
+[ "${pt:-0}" -gt "${pd:-0}" ]
+say $? "and then it repeats itself ($pt lines for $pd registers)"
+sh "$here/tools/mvm" stop --name "$P" >/dev/null 2>&1
+rm -rf "$MVM_HOME/$P"; docker context rm -f "mvm-$P" >/dev/null 2>&1
+
 [ "$fail" = 0 ] && echo "vcpus PASS" || echo "vcpus FAIL"
 exit "$fail"

@@ -9,8 +9,8 @@ extern fn hv_read_u16: str -> int;
 extern fn hv_write_u32: str -> int -> int;
 extern fn hv_write_u16: str -> int -> int;
 extern fn hv_read_u64: str -> str;
-extern fn hv_file_to_guest: str -> int -> str -> int -> int;
-extern fn hv_guest_to_file: str -> int -> str -> int -> int;
+extern fn hv_file_to_guest: str -> str -> str -> int -> int;
+extern fn hv_guest_to_file: str -> int -> str -> str -> int;
 extern fn hv_spi: int -> int -> int;
 
 let vio_base = 0xa000000;
@@ -113,10 +113,10 @@ let handle_request = fn (s) -> fn (disk: str) -> fn (head: int) ->
       let status_a = desc_addr s d2 in
       let wrote =
         if typ == blk_t_in then
-          let n = hv_file_to_guest disk (sec * sector) (hexs data_a) data_l in
+          let n = hv_file_to_guest disk (hexs (sec * sector)) (hexs data_a) data_l in
           if n < 0 then 0 - 1 else data_l
         else if typ == blk_t_out then
-          let n = hv_guest_to_file (hexs data_a) data_l disk (sec * sector) in
+          let n = hv_guest_to_file (hexs data_a) data_l disk (hexs (sec * sector)) in
           if n < 0 then 0 - 1 else 0
         else 0 - 1 in
       let _ = s32 status_a (if wrote < 0 then blk_s_unsupp else blk_s_ok) in
@@ -166,7 +166,7 @@ let vio_read = fn (s) -> fn (off: int) -> fn (capacity_sectors: int) ->
   else if off == 0x070 then (vec_get s st_status : int)
   else if off == 0x0fc then 0
   else if off == 0x100 then bit_and capacity_sectors 0xffffffff
-  else if off == 0x104 then 0
+  else if off == 0x104 then bit_and (bit_shr capacity_sectors 32) 0xffffffff
   else 0;
 
 let vio_write = fn (s) -> fn (off: int) -> fn (v: int) -> fn (disk: str) ->

@@ -74,6 +74,32 @@ static uint64_t hex64(const char *s) {
 }
 static const char *put64(uint64_t v) { snprintf(strbuf, sizeof strbuf, "0x%" PRIx64, v); return strbuf; }
 
+/* HAS THIS SYSTEM REGISTER BEEN SEEN BEFORE. Answers 1 the first time and 0
+ * after, so a trapped register is named once rather than on every access.
+ *
+ * The comment beside sys_name in boot.mere claimed this for a while before
+ * anything did it, and the claim was the whole safeguard: a register trapped
+ * in a loop would have printed on every one of them, which is how one stuck
+ * vsock table produced 177,680 lines and 12.9 MB.
+ *
+ * Here rather than in Mere because every CPU asks, and a table they share
+ * cannot be a Vec.
+ */
+#define SYS_SEEN_MAX 64
+static pthread_mutex_t SYS_M = PTHREAD_MUTEX_INITIALIZER;
+static int SYS_SEEN[SYS_SEEN_MAX];
+static int SYS_SEEN_N;
+int hv_sys_first(int key) {
+    pthread_mutex_lock(&SYS_M);
+    for (int i = 0; i < SYS_SEEN_N; i++)
+        if (SYS_SEEN[i] == key) { pthread_mutex_unlock(&SYS_M); return 0; }
+    /* Full means "say it": a machine trapping more than sixty-four distinct
+     * registers is telling us something, and silence is the wrong answer. */
+    if (SYS_SEEN_N < SYS_SEEN_MAX) SYS_SEEN[SYS_SEEN_N++] = key;
+    pthread_mutex_unlock(&SYS_M);
+    return 1;
+}
+
 /* How many device accesses the guest has made. Counted to answer one question
  * -- what a channel round trip per MMIO would cost -- and left because the
  * number is worth knowing. */
@@ -352,11 +378,18 @@ int hv_gic_up(const char *dist_hex, const char *redist_hex) {
 }
 
 /* ---- loading ------------------------------------------------------------ */
-long long hv_load_file(const char *path, const char *gpa_hex) {
+int hv_load_file(const char *path, const char *gpa_hex) {
     uint64_t gpa = hex64(gpa_hex);
     FILE *f = fopen(path, "rb");
     if (!f) return -1;
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    /* The count goes back through an int; say so rather than return a wrapped
+     * one. Nothing loaded here is close to this, and that is the point: if it
+     * ever is, it should stop rather than load a prefix and call it whole. */
+    if (sz > 0x7fffffffL) {
+        fprintf(stderr, "mvm: %s is %ld bytes, more than this can report\n", path, sz);
+        fclose(f); return -3;
+    }
     void *p = at(gpa, (size_t)sz);
     if (!p) { fclose(f); return -2; }
     size_t got = fread(p, 1, (size_t)sz, f);
@@ -483,6 +516,16 @@ const char *hv_read_u64(const char *gpa_hex) {
 static int DISK_FD = -1;
 static char DISK_PATH[1024];
 
+/* Every block access, when MVM_BLK_TRACE is set. This is how the truncation
+ * above was caught: a 20 GiB disk took 34,341 writes and not one of them
+ * landed past 4 GiB. A gate can ask the same question from outside. */
+static int BLK_TRACE = -1;
+static void blk_trace(char dir, uint64_t off, int len) {
+    if (BLK_TRACE < 0) BLK_TRACE = getenv("MVM_BLK_TRACE") ? 1 : 0;
+    if (BLK_TRACE) fprintf(stderr, "BLK%c off=%llu len=%d\n", dir,
+                           (unsigned long long)off, len);
+}
+
 static int disk_open(const char *path) {
     if (DISK_FD >= 0 && !strcmp(DISK_PATH, path)) return DISK_FD;
     if (DISK_FD >= 0) close(DISK_FD);
@@ -492,7 +535,26 @@ static int disk_open(const char *path) {
     return DISK_FD;
 }
 
-long long hv_file_to_guest(const char *path, long long off, const char *gpa_hex, int len) {
+/* THE OFFSET CROSSES AS A HEX STRING, for the same reason the guest address
+ * beside it does. Mere's int is 64 bits, but the extern prototype its compiler
+ * emits for one says C `int`, so a value the caller computed in 64 bits is
+ * truncated on the way in -- by the DECLARATION, with both sides compiling
+ * clean and nothing to see at the call.
+ *
+ * What that cost: the default disk is 20 GiB, and every offset at or past
+ * 2^32 wrapped to the bottom of the file. mke2fs reported success, then the
+ * block bitmaps for groups 32, 49, 64, 96 and 128 -- the ones that live above
+ * 4 GiB -- came back as whatever had been written over them, and the machine
+ * panicked with "Block bitmap for group 0 not in group (block 4294967295)".
+ * Every gate passed --disk-size 1024, 2048 or 4096, so not one of them was
+ * ever on the far side of the boundary.
+ *
+ * The byte counts these return stay ints: a count is bounded by len, which is
+ * one descriptor.
+ */
+int hv_file_to_guest(const char *path, const char *off_hex, const char *gpa_hex, int len) {
+    uint64_t off = hex64(off_hex);
+    blk_trace('R', off, len);
     void *p = at(hex64(gpa_hex), (size_t)len);
     if (!p) return -1;
     int fd = disk_open(path);
@@ -500,16 +562,18 @@ long long hv_file_to_guest(const char *path, long long off, const char *gpa_hex,
     ssize_t n = pread(fd, p, (size_t)len, (off_t)off);
     if (n < 0) return -1;
     memset((char *)p + n, 0, (size_t)len - (size_t)n);   /* a short read is zeroes */
-    return (long long)n;
+    return (int)n;
 }
 
-long long hv_guest_to_file(const char *gpa_hex, int len, const char *path, long long off) {
+int hv_guest_to_file(const char *gpa_hex, int len, const char *path, const char *off_hex) {
+    uint64_t off = hex64(off_hex);
+    blk_trace('W', off, len);
     void *p = at(hex64(gpa_hex), (size_t)len);
     if (!p) return -1;
     int fd = disk_open(path);
     if (fd < 0) return -1;
     ssize_t n = pwrite(fd, p, (size_t)len, (off_t)off);
-    return n < 0 ? -1 : (long long)n;
+    return n < 0 ? -1 : (int)n;
 }
 
 /* ---- injecting an interrupt -------------------------------------------- */

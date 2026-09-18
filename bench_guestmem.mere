@@ -9,12 +9,12 @@
 // reads to walk a descriptor chain, then one bulk transfer of the data.
 
 extern fn hv_up: unit -> int;
-extern fn hv_map: str -> int -> int;
+extern fn hv_map: str -> str -> int;
 extern fn hv_read_u32: str -> int;
 extern fn hv_read_u16: str -> int;
 extern fn hv_write_u16: str -> int -> int;
 extern fn hv_read_u64: str -> str;
-extern fn hv_file_to_guest: str -> int -> str -> int -> int;
+extern fn hv_file_to_guest: str -> str -> str -> int -> int;
 extern fn now_ms: unit -> int;
 
 let base = "0x40000000";
@@ -28,7 +28,7 @@ let gpa = fn (off: int) -> "0x" ++ hex (0x40000000 + off);
 
 let bench = fn (reqs: int) -> fn (bufsize: int) -> fn (disk: str) ->
   let _ = hv_up () in
-  let _ = hv_map base 268435456 in          // 256 MiB
+  let _ = hv_map base "0x10000000" in       // 256 MiB
   let t0 = now_ms () in
   // Per request: ten field accesses walking a descriptor chain, then the data.
   let rec go = fn (i: int) -> fn (acc: int) ->
@@ -45,7 +45,7 @@ let bench = fn (reqs: int) -> fn (bufsize: int) -> fn (disk: str) ->
       let g = hv_read_u32 (gpa (d + 24)) in
       let h = hv_read_u16 (gpa (d + 28)) in
       let k = hv_read_u16 (gpa (d + 30)) in
-      let n = hv_file_to_guest disk ((i * bufsize) % 8388608) (gpa 1048576) bufsize in
+      let n = hv_file_to_guest disk ("0x" ++ hex ((i * bufsize) % 8388608)) (gpa 1048576) bufsize in
       go (i + 1) (acc + a + b + c + e + f + g + h + k + n) in
   let checked = go 0 0 in
   let t1 = now_ms () in
